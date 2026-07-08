@@ -1,0 +1,18 @@
+[Unit]
+Description=Plexamp Headless
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ plexamp_user }}
+Group={{ plexamp_group }}
+WorkingDirectory={{ plexamp_home }}
+ExecStart={{ plexamp_node_bin }} {{ plexamp_home }}/js/index.js
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

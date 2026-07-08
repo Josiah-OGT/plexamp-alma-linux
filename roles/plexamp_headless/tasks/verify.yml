@@ -1,0 +1,43 @@
+---
+# Three things Ansible can't do for you:
+#  1. Claiming is an interactive stdin prompt tied to your Plex account —
+#     no unattended API for it. Confirmed against a live test VM: Plexamp
+#     doesn't bind its web UI port at all until claimed, and systemd's
+#     Type=simple service has stdin wired to /dev/null, so the claim token
+#     can NEVER be entered while running as the service. It must be done
+#     as a one-off foreground run first.
+#  2. ALSA device selection and enabling Remote Control both live in the
+#     Plexamp web UI, not a config file this role can template safely.
+#  3. Confirming bit-perfect output requires actually playing audio.
+#
+# Found by testing against real hardware: "Sample Rate Matching" defaults to
+# Disabled, which silently resamples every track to a fixed internal rate
+# before output (verified: a 44.1kHz source measured as 96000 at the ALSA
+# hw_params level with it Disabled, and correctly as 44100 once switched to
+# Strict). This is Plexamp Linux's equivalent of the "bit-perfect"/exclusive
+# mode toggle other platforms expose more visibly — easy to miss since
+# everything else (device selection, hw: passthrough) can be correct while
+# this one setting quietly defeats bit-perfect output.
+- name: Show post-install steps
+  ansible.builtin.debug:
+    msg:
+      - "Plexamp headless {{ plexamp_version }} is installed on {{ inventory_hostname }}."
+      - ""
+      - "If this is a first-time install (unclaimed device), claim it now — the"
+      - "web UI will not be reachable until this is done:"
+      - "  1. sudo systemctl stop {{ plexamp_service_name }}"
+      - "  2. sudo -u {{ plexamp_user }} {{ plexamp_node_bin }} {{ plexamp_home }}/js/index.js"
+      - "  3. Visit https://plex.tv/claim, copy the token, paste it into that terminal when prompted"
+      - "     (claim tokens expire in a few minutes — have the browser tab ready first)"
+      - "  4. Once it confirms claimed, Ctrl+C"
+      - "  5. sudo systemctl start {{ plexamp_service_name }}"
+      - ""
+      - "Then open http://{{ ansible_facts['default_ipv4']['address'] }}:32500 and set:"
+      - "  Settings > Playback > Audio Output > Audio Device          -> your USB DAC (check with `aplay -l` on the host)"
+      - "  Settings > Playback > Audio Output > Sample Rate Matching  -> Strict (defaults to Disabled, which silently resamples everything)"
+      - "  Settings > Remote Control > Enable Remote Control          -> on"
+      - "  Settings > Playback > Loudness Leveling                    -> off, if you want gain left untouched too"
+      - "Verify bit-perfect output with: cat /proc/asound/card*/pcm*/sub0/hw_params"
+      - "  (play something first — 'closed' just means nothing is playing at that instant)"
+      - "  Confirm rate: matches the source file, then replay a different-sample-rate"
+      - "  track and re-check — it should change too, proving it's switching, not coincidence."

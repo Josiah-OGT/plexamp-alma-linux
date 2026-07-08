@@ -1,0 +1,12 @@
+---
+galaxy_info:
+  role_name: plexamp_headless
+  description: Deploy Plexamp headless (Plex Pass) audio endpoint on RHEL-family hosts
+  min_ansible_version: "2.15"
+  platforms:
+    - name: EL
+      versions:
+        - "10"
+
+collections:
+  - ansible.posix

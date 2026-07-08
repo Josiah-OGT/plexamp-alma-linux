@@ -1,0 +1,14 @@
+---
+- name: Deploy systemd unit
+  ansible.builtin.template:
+    src: plexamp.service.j2
+    dest: "/etc/systemd/system/{{ plexamp_service_name }}.service"
+    mode: "0644"
+  notify: restart plexamp
+
+- name: Enable and start Plexamp service
+  ansible.builtin.systemd:
+    name: "{{ plexamp_service_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true

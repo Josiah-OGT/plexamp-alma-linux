@@ -1,0 +1,62 @@
+---
+- name: Install archive/audio/firewall/SELinux tooling
+  ansible.builtin.dnf:
+    name:
+      - tar
+      - bzip2
+      - rsync
+      - alsa-utils
+      - firewalld
+      - policycoreutils-python-utils
+      - python3-libselinux
+    state: present
+
+- name: Ensure firewalld is running
+  ansible.builtin.systemd:
+    name: firewalld
+    enabled: true
+    state: started
+
+# AlmaLinux 10 AppStream ships Node.js 22 by default (RHEL 10 dropped
+# modularity, so there's no alternate stream to select). But Plexamp
+# headless 4.13.2 ships a native audio-engine binding (treble.node)
+# compiled against Node 20's ABI — under Node 22 it fails to load with
+# ERR_DLOPEN_FAILED: "Module did not self-register", confirmed by running
+# it against a live test VM. Node 20 via NodeSource is required, not just
+# "20 or newer".
+- name: Check installed Node.js package origin
+  ansible.builtin.command: rpm -q nodejs
+  register: plexamp_installed_node
+  changed_when: false
+  failed_when: false
+
+- name: Remove AppStream Node.js (conflicts with NodeSource's package)
+  ansible.builtin.dnf:
+    name: "nodejs*"
+    state: absent
+  when: "'nodesource' not in plexamp_installed_node.stdout"
+
+- name: Add NodeSource repository for Node.js 20.x
+  ansible.builtin.shell: curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+  args:
+    creates: /etc/yum.repos.d/nodesource-nodejs.repo
+
+- name: Install Node.js 20.x from NodeSource
+  ansible.builtin.dnf:
+    name: nodejs
+    state: present
+
+- name: Verify installed Node.js version
+  ansible.builtin.command: node --version
+  register: plexamp_node_version
+  changed_when: false
+
+- name: Fail if Node.js is not v20.x
+  ansible.builtin.assert:
+    that:
+      - plexamp_node_version.stdout is regex('^v20\.')
+    fail_msg: >-
+      Installed Node.js ({{ plexamp_node_version.stdout }}) is not v20.x.
+      Plexamp headless 4.13.2's native treble.node binding is ABI-pinned to
+      Node 20 — other majors fail with ERR_DLOPEN_FAILED at runtime, not at
+      install time, so this must be checked explicitly.

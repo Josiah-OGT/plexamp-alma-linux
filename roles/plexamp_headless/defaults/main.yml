@@ -1,0 +1,27 @@
+---
+plexamp_user: plexamp
+plexamp_group: plexamp
+plexamp_home: /opt/plexamp
+plexamp_service_name: plexamp
+
+# Leave empty to auto-resolve the latest release from
+# https://plexamp.plex.tv/headless/version.json at run time.
+# Pin an explicit version (e.g. "4.13.2") for repeatable deploys.
+plexamp_version: ""
+
+# Node.js binary used by the systemd unit. AlmaLinux 10 AppStream and the
+# NodeSource RPM repo both install to /usr/bin/node, so this rarely needs
+# overriding.
+plexamp_node_bin: /usr/bin/node
+
+# LAN CIDR allowed to reach the web UI (32500) and Plex discovery ports.
+# MUST be overridden per environment — there is no safe default.
+plexamp_lan_cidr: "CHANGE_ME/24"
+
+# Ports opened for plexamp_lan_cidr. Shared between firewall.yml's add and
+# stale-rule-removal logic — keep this the single source of truth.
+plexamp_firewall_ports:
+  - { port: "32500", proto: "tcp" }        # Plexamp headless web UI/control
+  - { port: "32410-32414", proto: "udp" }  # Plex GDM discovery
+  - { port: "5353", proto: "udp" }         # mDNS/Bonjour discovery
+  - { port: "1900", proto: "udp" }         # SSDP discovery

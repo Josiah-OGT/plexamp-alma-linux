@@ -1,0 +1,101 @@
+---
+# https://plexamp.plex.tv/headless/version.json returns:
+#   {"latestVersion": "4.13.2", "updateUrl": "https://.../Plexamp-Linux-headless-v4.13.2.tar.bz2"}
+# Served as application/octet-stream, not application/json, so the uri
+# module won't auto-populate `.json` — parse `.content` explicitly instead.
+- name: Look up latest Plexamp headless release
+  ansible.builtin.uri:
+    url: https://plexamp.plex.tv/headless/version.json
+    return_content: true
+  register: plexamp_release_info
+  when: plexamp_version | length == 0
+
+- name: Resolve target version and download URL
+  ansible.builtin.set_fact:
+    plexamp_version: "{{ (plexamp_release_info.content | from_json).latestVersion }}"
+    plexamp_download_url: "{{ (plexamp_release_info.content | from_json).updateUrl }}"
+  when: plexamp_release_info is not skipped
+
+- name: Build download URL for pinned version
+  ansible.builtin.set_fact:
+    plexamp_download_url: "https://plexamp.plex.tv/headless/Plexamp-Linux-headless-v{{ plexamp_version }}.tar.bz2"
+  when: plexamp_download_url is not defined
+
+- name: Check currently installed version marker
+  ansible.builtin.slurp:
+    src: "{{ plexamp_home }}/.ansible_version"
+  register: plexamp_installed_marker
+  failed_when: false
+
+- name: Determine whether install/upgrade is needed
+  ansible.builtin.set_fact:
+    plexamp_needs_install: >-
+      {{ (plexamp_installed_marker.content | default('') | b64decode | trim)
+         != plexamp_version }}
+
+- name: Download and install Plexamp headless {{ plexamp_version }}
+  when: plexamp_needs_install
+  block:
+    - name: Download release archive
+      ansible.builtin.get_url:
+        url: "{{ plexamp_download_url }}"
+        dest: "/tmp/plexamp-headless-{{ plexamp_version }}.tar.bz2"
+        mode: "0644"
+
+    - name: Clear staging directory
+      ansible.builtin.file:
+        path: /tmp/plexamp-staging
+        state: "{{ item }}"
+      loop: [absent, directory]
+
+    - name: Extract archive to staging directory
+      ansible.builtin.unarchive:
+        src: "/tmp/plexamp-headless-{{ plexamp_version }}.tar.bz2"
+        dest: /tmp/plexamp-staging
+        remote_src: true
+
+    # The release tarball's top-level directory name isn't guaranteed
+    # (varies by release/packaging), so discover it instead of assuming
+    # --strip-components=1 always applies cleanly.
+    - name: Discover extracted top-level directory
+      ansible.builtin.find:
+        paths: /tmp/plexamp-staging
+        file_type: directory
+        depth: 1
+      register: plexamp_staging_dirs
+
+    - name: Determine source path to sync from
+      ansible.builtin.set_fact:
+        plexamp_sync_src: >-
+          {{ (plexamp_staging_dirs.files | length > 0)
+             | ternary(plexamp_staging_dirs.files[0].path, '/tmp/plexamp-staging') }}
+
+    - name: Sync extracted files into install directory
+      ansible.builtin.command: >-
+        rsync -a --delete
+        {{ plexamp_sync_src }}/ {{ plexamp_home }}/
+      changed_when: true
+
+    - name: Record installed version marker
+      ansible.builtin.copy:
+        content: "{{ plexamp_version }}"
+        dest: "{{ plexamp_home }}/.ansible_version"
+        owner: "{{ plexamp_user }}"
+        group: "{{ plexamp_group }}"
+        mode: "0644"
+
+    - name: Fix ownership of install directory
+      ansible.builtin.file:
+        path: "{{ plexamp_home }}"
+        owner: "{{ plexamp_user }}"
+        group: "{{ plexamp_group }}"
+        recurse: true
+
+    - name: Clean up downloaded archive and staging directory
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/plexamp-headless-{{ plexamp_version }}.tar.bz2"
+        - /tmp/plexamp-staging
+  notify: restart plexamp

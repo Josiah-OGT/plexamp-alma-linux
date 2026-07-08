@@ -1,0 +1,52 @@
+---
+# Scoped to LAN via rich rules (not the plain `port:` param, which would
+# open these to the whole zone regardless of source). None of this should
+# ever be forwarded on the router — it's a LAN-only appliance.
+#
+# The firewalld module only ever *adds* rules, so if plexamp_lan_cidr
+# changes between runs (e.g. moving a host from a test subnet to its real
+# LAN), the old CIDR's rules are left behind as stale, overly-permissive
+# leftovers. A marker file tracks the previously-applied CIDR so a change
+# gets cleaned up rather than silently accumulating.
+- name: Check previously applied LAN CIDR
+  ansible.builtin.slurp:
+    src: /etc/plexamp-lan-cidr
+  register: plexamp_prev_cidr_raw
+  failed_when: false
+
+- name: Remove rich rules for a previous LAN CIDR
+  when:
+    - plexamp_prev_cidr_raw.content is defined
+    - (plexamp_prev_cidr_raw.content | b64decode | trim) != plexamp_lan_cidr
+  ansible.posix.firewalld:
+    rich_rule: >-
+      rule family="ipv4"
+      source address="{{ plexamp_prev_cidr_raw.content | b64decode | trim }}"
+      port port="{{ item.port }}" protocol="{{ item.proto }}"
+      accept
+    permanent: true
+    immediate: true
+    state: disabled
+  loop: "{{ plexamp_firewall_ports }}"
+  loop_control:
+    label: "{{ item.port }}/{{ item.proto }}"
+
+- name: Allow Plexamp/Plex discovery and control from LAN only
+  ansible.posix.firewalld:
+    rich_rule: >-
+      rule family="ipv4"
+      source address="{{ plexamp_lan_cidr }}"
+      port port="{{ item.port }}" protocol="{{ item.proto }}"
+      accept
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ plexamp_firewall_ports }}"
+  loop_control:
+    label: "{{ item.port }}/{{ item.proto }}"
+
+- name: Record applied LAN CIDR
+  ansible.builtin.copy:
+    content: "{{ plexamp_lan_cidr }}"
+    dest: /etc/plexamp-lan-cidr
+    mode: "0644"

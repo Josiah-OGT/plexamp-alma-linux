@@ -1,0 +1,29 @@
+---
+- name: Deploy Plexamp headless audio endpoint
+  hosts: plexamp_endpoint
+  become: true
+
+  pre_tasks:
+    # Minimal AlmaLinux/RHEL 10 installs lack these — without them,
+    # NetworkManager can't drive a wifi device at all (falls back to
+    # "creating generic device" and the radio sits unmanaged regardless of
+    # driver/rfkill state).
+    - name: Ensure wifi support is available
+      ansible.builtin.dnf:
+        name:
+          - NetworkManager-wifi
+          - wpa_supplicant
+        state: present
+      register: plexamp_wifi_pkgs
+
+    - name: Restart NetworkManager to load the wifi plugin
+      ansible.builtin.systemd:
+        name: NetworkManager
+        state: restarted
+      when: plexamp_wifi_pkgs is changed
+
+  roles:
+    - role: plexamp_headless
+      vars:
+        plexamp_lan_cidr: "CHANGE_ME/24"        # set to your actual LAN subnet
+        # plexamp_version: "4.13.2"          # uncomment to pin a version

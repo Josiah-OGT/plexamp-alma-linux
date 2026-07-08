@@ -1,0 +1,29 @@
+---
+- name: Fail fast if LAN CIDR was not set
+  ansible.builtin.assert:
+    that:
+      - plexamp_lan_cidr != "CHANGE_ME/24"
+    fail_msg: >-
+      plexamp_lan_cidr must be set to your actual LAN subnet
+      (e.g. 192.168.1.0/24) — refusing to open ports with no scope.
+
+- name: Install packages
+  ansible.builtin.import_tasks: install.yml
+
+- name: Create service account
+  ansible.builtin.import_tasks: user.yml
+
+- name: Download and stage Plexamp headless
+  ansible.builtin.import_tasks: download.yml
+
+- name: Apply SELinux context
+  ansible.builtin.import_tasks: selinux.yml
+
+- name: Configure systemd service
+  ansible.builtin.import_tasks: service.yml
+
+- name: Configure firewalld
+  ansible.builtin.import_tasks: firewall.yml
+
+- name: Print post-install instructions
+  ansible.builtin.import_tasks: verify.yml

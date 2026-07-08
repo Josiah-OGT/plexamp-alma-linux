@@ -1,0 +1,26 @@
+---
+- name: Create plexamp group
+  ansible.builtin.group:
+    name: "{{ plexamp_group }}"
+    system: true
+
+- name: Create plexamp system user
+  ansible.builtin.user:
+    name: "{{ plexamp_user }}"
+    group: "{{ plexamp_group }}"
+    groups: audio
+    append: true
+    system: true
+    home: "{{ plexamp_home }}"
+    create_home: false
+    # RHEL 10 is usrmerged; /sbin/nologin and /usr/sbin/nologin are the
+    # same file, but /sbin/nologin is the canonical path on EL.
+    shell: /sbin/nologin
+
+- name: Create install directory
+  ansible.builtin.file:
+    path: "{{ plexamp_home }}"
+    state: directory
+    owner: "{{ plexamp_user }}"
+    group: "{{ plexamp_group }}"
+    mode: "0755"
