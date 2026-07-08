@@ -8,6 +8,7 @@
   ansible.builtin.command: restorecon -Rv {{ plexamp_home }}
   register: plexamp_restorecon
   changed_when: "'Relabeled' in plexamp_restorecon.stdout"
+  when: ansible_facts.selinux.status | default('') == 'enabled'
 
 # Port 32500 is unprivileged (>1024) and not a distinct SELinux port type
 # under the targeted policy, so a custom semanage port rule normally isn't

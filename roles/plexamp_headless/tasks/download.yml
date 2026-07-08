@@ -70,9 +70,16 @@
           {{ (plexamp_staging_dirs.files | length > 0)
              | ternary(plexamp_staging_dirs.files[0].path, '/tmp/plexamp-staging') }}
 
+    # plexamp_home doubles as the service account's $HOME, so Plexamp's
+    # runtime state lives alongside the app files: .local (Settings/ incl.
+    # the claim token), .cache, and Library. Without these excludes,
+    # --delete would strip all of it on every version bump — silently
+    # unclaiming the device and losing every web-UI setting.
     - name: Sync extracted files into install directory
       ansible.builtin.command: >-
         rsync -a --delete
+        --exclude=/.local --exclude=/.cache --exclude=/.config
+        --exclude=/Library --exclude=/.ansible_version
         {{ plexamp_sync_src }}/ {{ plexamp_home }}/
       changed_when: true
 

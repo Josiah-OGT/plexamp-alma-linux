@@ -36,10 +36,14 @@
     state: absent
   when: "'nodesource' not in plexamp_installed_node.stdout"
 
+# pipefail matters: without it a failed curl feeds bash empty input, the
+# task "succeeds", and the nodejs install below silently falls back to
+# whatever dnf can find (AppStream's Node 22 again).
 - name: Add NodeSource repository for Node.js 20.x
-  ansible.builtin.shell: curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+  ansible.builtin.shell: set -o pipefail; curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
   args:
     creates: /etc/yum.repos.d/nodesource-nodejs.repo
+    executable: /bin/bash
 
 - name: Install Node.js 20.x from NodeSource
   ansible.builtin.dnf:

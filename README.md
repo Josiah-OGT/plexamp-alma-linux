@@ -75,6 +75,17 @@ ansible-playbook plexamp.yml -i inventory.ini --ask-become-pass
 Everything else about the run is identical to the remote case — same
 idempotency, same firewall/CIDR caveat above.
 
+## Upgrades
+
+Re-run the playbook. With `plexamp_version` left empty it tracks Plex's
+latest published headless release; the role only re-downloads when the
+version actually changed, then restarts the service. App files are replaced
+wholesale, but runtime state under the install directory (`.local` — which
+holds the claim and all web-UI settings — `.cache`, `Library`) is preserved,
+so upgrades never require re-claiming or reconfiguring. Pin
+`plexamp_version` in `plexamp.yml` if you'd rather upgrades only happen when
+you choose.
+
 ## After it runs
 
 The playbook prints exact next steps at the end (claiming — which needs a

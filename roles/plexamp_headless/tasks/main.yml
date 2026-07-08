@@ -3,9 +3,11 @@
   ansible.builtin.assert:
     that:
       - plexamp_lan_cidr != "CHANGE_ME/24"
+      - plexamp_lan_cidr is match('^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$')
     fail_msg: >-
-      plexamp_lan_cidr must be set to your actual LAN subnet
-      (e.g. 192.168.1.0/24) — refusing to open ports with no scope.
+      plexamp_lan_cidr must be set to your actual IPv4 LAN subnet in CIDR
+      form (e.g. 192.168.1.0/24) — refusing to open ports with no scope.
+      Current value: {{ plexamp_lan_cidr }}
 
 - name: Install packages
   ansible.builtin.import_tasks: install.yml

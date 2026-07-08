@@ -2,6 +2,12 @@
 Description=Plexamp Headless
 After=network-online.target sound.target
 Wants=network-online.target
+# Unattended appliance: never stop retrying. A start limit would leave the
+# unit permanently 'failed' after a burst of crashes (e.g. network blip at
+# boot), turning a recoverable hiccup into a dead endpoint until someone
+# SSHes in. A persistent failure stays visible in journalctl either way.
+# (StartLimit* must live in [Unit]; systemd ignores it under [Service].)
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -11,8 +17,6 @@ WorkingDirectory={{ plexamp_home }}
 ExecStart={{ plexamp_node_bin }} {{ plexamp_home }}/js/index.js
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target
