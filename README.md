@@ -6,6 +6,16 @@ audio bindings actually require, sets up the systemd service, opens only
 what's needed in `firewalld` scoped to your LAN, and gets wifi working on
 installs that don't ship it by default.
 
+## Why x86?
+
+Nearly every headless-Plexamp guide out there targets ARM boards — a
+Raspberry Pi, in particular. This project exists for the opposite case:
+you've got a spare **x86_64** box (an old mini PC, a NUC, a repurposed
+desktop) and want to run the same bit-perfect setup on it. The Node.js
+version pinning, package sourcing, and native-binding concerns this role
+handles are specific to x86_64 AlmaLinux 10 — don't expect it to work
+unmodified on an ARM target.
+
 ## Layout
 
 ```
