@@ -12,8 +12,12 @@ mpd_upnp_debian_image: docker.io/library/debian:trixie-slim
 mpd_upnp_friendly_name: "Hifi DAC"
 
 # ALSA device MPD plays to. "default" works everywhere but goes through
-# dmix (resampling!). For bit-perfect output set the raw hardware device,
-# e.g. "hw:1,0" — find yours with `aplay -l` on the host.
+# dmix (resampling!). For bit-perfect output set the raw hardware device
+# BY NAME, e.g. "hw:CARD=AUDIO" — card ids are the bracketed names in
+# /proc/asound/cards. Prefer this over "hw:0,0": card numbers are USB
+# enumeration order and can swap between boots, and if the DAC and onboard
+# audio ever trade places MPD plays to the wrong output while looking
+# perfectly healthy.
 mpd_upnp_alsa_device: "default"
 
 # "none" = no volume control in the audio path at all — bit-perfect, volume

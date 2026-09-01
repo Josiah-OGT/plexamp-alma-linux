@@ -137,8 +137,11 @@ ansible-playbook mpd-upnp.yml -i inventory.ini
 
 Two defaults you'll want to override in `mpd-upnp.yml` for real hardware:
 - `mpd_upnp_alsa_device` — defaults to `"default"` (safe everywhere, but
-  that's dmix, which **resamples**). Set your DAC's raw device, e.g.
-  `"hw:1,0"` from `aplay -l`.
+  that's dmix, which **resamples**). Set your DAC's raw device **by name**,
+  e.g. `"hw:CARD=AUDIO"` — the id is the bracketed name in
+  `/proc/asound/cards`. Avoid `"hw:0,0"`-style numbers: they're USB
+  enumeration order, and a boot where the DAC and onboard audio swap
+  places would silently send playback to the wrong output.
 - `mpd_upnp_friendly_name` — the name Symfonium's cast menu shows.
 
 In Symfonium, pick the **OpenHome** entry of the renderer (it appears twice):
