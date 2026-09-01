@@ -1,0 +1,35 @@
+# Managed by Ansible (mpd_upnp role).
+# MPD here is purely a playback engine fed stream URLs by upmpdcli — there
+# is no local music library. Control stays on 127.0.0.1 (host network
+# namespace, shared with the upmpdcli container); nothing binds the LAN.
+
+bind_to_address "127.0.0.1"
+port "6600"
+
+# No local library, but MPD wants the directories to exist.
+music_directory "/var/lib/mpd/music"
+playlist_directory "/var/lib/mpd/playlists"
+db_file "/var/lib/mpd/tag_cache"
+state_file "/var/lib/mpd/state"
+sticker_file "/var/lib/mpd/sticker.sql"
+
+# Renderer discovery is upmpdcli's job (UPnP/SSDP); no avahi in the
+# container, so don't try to register mDNS.
+zeroconf_enabled "no"
+
+# Leave the samples alone: no replaygain, no normalization.
+replaygain "off"
+volume_normalization "no"
+
+audio_output {
+    type "alsa"
+    name "{{ mpd_upnp_friendly_name }}"
+    device "{{ mpd_upnp_alsa_device }}"
+    mixer_type "{{ mpd_upnp_mixer_type }}"
+    # The bit-perfect part: never resample/reformat to a fixed rate — open
+    # the device at the source file's native rate/format/channels, exactly
+    # the behaviour "Sample Rate Matching: Strict" gave Plexamp.
+    auto_resample "no"
+    auto_format "no"
+    auto_channels "no"
+}

@@ -1,0 +1,39 @@
+---
+mpd_upnp_base_dir: /opt/mpd-upnp
+mpd_upnp_image: localhost/mpd-upnp:latest
+
+# Base image for the local build. MPD and upmpdcli have no EL10 packages
+# anywhere (checked live: EPEL 10, RPM Fusion EL10, COPR, and upstream's own
+# repos ship nothing for RHEL-family 10), so the role builds a small Debian
+# container where both are first-class, well-maintained packages.
+mpd_upnp_debian_image: docker.io/library/debian:trixie-slim
+
+# Name Symfonium (and any other UPnP/OpenHome control point) will see.
+mpd_upnp_friendly_name: "Hifi DAC"
+
+# ALSA device MPD plays to. "default" works everywhere but goes through
+# dmix (resampling!). For bit-perfect output set the raw hardware device,
+# e.g. "hw:1,0" — find yours with `aplay -l` on the host.
+mpd_upnp_alsa_device: "default"
+
+# "none" = no volume control in the audio path at all — bit-perfect, volume
+# is your amp's job (Symfonium's volume slider will do nothing).
+# "hardware" = use the DAC's own hardware mixer if it has one; still
+# bit-perfect for the sample values when at 100%.
+# Never "software" on this box — that defeats the point.
+mpd_upnp_mixer_type: "none"
+
+# Port upmpdcli's UPnP stack listens on (control, eventing). Fixed so the
+# firewall scope below can be exact instead of a dynamic-port range.
+mpd_upnp_upnp_port: 49152
+
+# LAN CIDR allowed to reach the renderer's control port + SSDP discovery.
+# MUST be overridden per environment — there is no safe default.
+mpd_upnp_lan_cidr: "CHANGE_ME/24"
+
+# Ports opened for mpd_upnp_lan_cidr. Shared between firewall.yml's add and
+# stale-rule-removal logic — keep this the single source of truth.
+# MPD itself (6600) stays on 127.0.0.1 and is never opened.
+mpd_upnp_firewall_ports:
+  - { port: "{{ mpd_upnp_upnp_port }}", proto: "tcp" }  # UPnP control/eventing (upmpdcli)
+  - { port: "1900", proto: "udp" }                      # SSDP discovery

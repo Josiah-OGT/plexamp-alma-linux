@@ -1,0 +1,26 @@
+# Managed by Ansible (mpd_upnp role).
+
+# What Symfonium (and any UPnP/OpenHome control point) shows in its cast menu.
+friendlyname = {{ mpd_upnp_friendly_name }}
+
+# MPD lives in the sibling container on the shared host network namespace.
+mpdhost = 127.0.0.1
+mpdport = 6600
+
+# Fixed port for the UPnP control/eventing listener so the firewall can be
+# scoped exactly (libnpupnp would otherwise pick a dynamic port at start).
+upnpport = {{ mpd_upnp_upnp_port }}
+
+# Advertise both faces: OpenHome (renderer-held playlist, proper gapless,
+# playback survives the phone dropping off) and plain UPnP AV for control
+# points that only speak that.
+openhome = 1
+upnpav = 1
+
+# Don't second-guess the server's declared MIME/protocolinfo before handing
+# a URL to MPD — some servers under-declare and the check rejects streams
+# MPD plays fine. MPD is the judge of what it can decode.
+checkcontentformat = 0
+
+# Persist OpenHome state (playlist, radio) across restarts.
+cachedir = /var/cache/upmpdcli

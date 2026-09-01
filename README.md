@@ -20,9 +20,11 @@ unmodified on an ARM target.
 
 ```
 plexamp.yml          # the playbook — edit plexamp_lan_cidr here before running
+mpd-upnp.yml          # optional second playbook: Navidrome/Symfonium endpoint (see below)
 inventory.ini         # target host(s) — edit before running
 requirements.yml      # ansible.posix collection (needed for the firewalld module)
 roles/plexamp_headless/
+roles/mpd_upnp/
 ```
 
 ## Prerequisites
@@ -107,3 +109,42 @@ that just installed. The short version, if you've done this before:
 - `Settings > Playback > Audio Output > Sample Rate Matching` → **Strict** (defaults to Disabled, which silently resamples everything)
 - `Settings > Remote Control > Enable Remote Control` → on
 - Verify with `cat /proc/asound/card*/pcm*/sub0/hw_params` while something's playing
+
+## Second role: `mpd_upnp` — the same endpoint for Navidrome/Symfonium
+
+If your library also lives in [Navidrome](https://www.navidrome.org/) (or any
+Subsonic-compatible server) and you drive it from
+[Symfonium](https://symfonium.app/), `mpd-upnp.yml` turns the same box into a
+**UPnP/OpenHome renderer**: MPD as the playback engine, fronted by
+[upmpdcli](https://www.lesbonscomptes.com/upmpdcli/). Symfonium casts to it,
+the box pulls the FLAC straight from Navidrome, and MPD plays it out the DAC
+with no resampling. It coexists with Plexamp — they just can't both hold the
+ALSA device at the same instant.
+
+Neither MPD nor upmpdcli is packaged anywhere for EL10 (EPEL 10, RPM Fusion
+EL10, COPR and upstream were all checked — nothing), so the role builds a
+small **Debian container** where both are first-class packages (upmpdcli from
+its developer's own apt repo — it isn't in Debian's archive either) and runs
+it as two podman quadlet services sharing the host network: `mpd.service`
+(bound to 127.0.0.1 only) and `upmpdcli.service` (UPnP control on TCP 49152 +
+SSDP, firewalled to your LAN CIDR). The container gets `/dev/snd` directly,
+so the bit-perfect path is identical to native.
+
+```bash
+# edit mpd_upnp_lan_cidr in mpd-upnp.yml first, same rules as plexamp_lan_cidr
+ansible-playbook mpd-upnp.yml -i inventory.ini
+```
+
+Two defaults you'll want to override in `mpd-upnp.yml` for real hardware:
+- `mpd_upnp_alsa_device` — defaults to `"default"` (safe everywhere, but
+  that's dmix, which **resamples**). Set your DAC's raw device, e.g.
+  `"hw:1,0"` from `aplay -l`.
+- `mpd_upnp_friendly_name` — the name Symfonium's cast menu shows.
+
+In Symfonium, pick the **OpenHome** entry of the renderer (it appears twice):
+that keeps the queue on the box itself, with proper gapless, and playback
+survives the phone sleeping. Verify bit-perfect output the same way as
+Plexamp: `hw_params` while two tracks of different sample rates play.
+Volume is intentionally not in the audio path (`mixer_type "none"`) — use
+your amp, or set `mpd_upnp_mixer_type: "hardware"` if your DAC has a real
+hardware mixer.

@@ -1,0 +1,28 @@
+---
+- name: Fail fast if LAN CIDR was not set
+  ansible.builtin.assert:
+    that:
+      - mpd_upnp_lan_cidr != "CHANGE_ME/24"
+      - mpd_upnp_lan_cidr is match('^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$')
+    fail_msg: >-
+      mpd_upnp_lan_cidr must be set to your actual IPv4 LAN subnet in CIDR
+      form (e.g. 192.168.1.0/24) — refusing to open ports with no scope.
+      Current value: {{ mpd_upnp_lan_cidr }}
+
+- name: Install packages
+  ansible.builtin.import_tasks: install.yml
+
+- name: Build the mpd+upmpdcli container image
+  ansible.builtin.import_tasks: image.yml
+
+- name: Deploy MPD and upmpdcli configuration
+  ansible.builtin.import_tasks: config.yml
+
+- name: Deploy podman quadlets
+  ansible.builtin.import_tasks: containers.yml
+
+- name: Configure firewalld
+  ansible.builtin.import_tasks: firewall.yml
+
+- name: Print post-install instructions
+  ansible.builtin.import_tasks: verify.yml

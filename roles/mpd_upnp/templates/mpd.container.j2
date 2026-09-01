@@ -1,0 +1,28 @@
+# Managed by Ansible (mpd_upnp role). Podman quadlet.
+[Unit]
+Description=MPD playback engine (mpd_upnp)
+After=network-online.target sound.target
+Wants=network-online.target
+# Unattended appliance: never stop retrying (same reasoning as the
+# plexamp_headless unit — StartLimit* must live in [Unit]).
+StartLimitIntervalSec=0
+
+[Container]
+ContainerName=mpd
+Image={{ mpd_upnp_image }}
+# Host network: MPD binds 127.0.0.1 only (see mpd.conf); sharing the host
+# namespace is what lets the upmpdcli container reach it on localhost.
+Network=host
+# Direct ALSA access — the whole point. Works under enforcing SELinux with
+# no booleans: podman relabels the mapped device nodes (verified live).
+AddDevice=/dev/snd
+Volume={{ mpd_upnp_base_dir }}/etc/mpd.conf:/etc/mpd.conf:ro,z
+Volume={{ mpd_upnp_base_dir }}/state/mpd:/var/lib/mpd:Z
+Exec=mpd --no-daemon --stderr /etc/mpd.conf
+
+[Service]
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

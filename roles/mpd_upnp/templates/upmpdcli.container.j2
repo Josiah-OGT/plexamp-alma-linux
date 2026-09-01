@@ -1,0 +1,24 @@
+# Managed by Ansible (mpd_upnp role). Podman quadlet.
+[Unit]
+Description=upmpdcli UPnP/OpenHome renderer (mpd_upnp)
+Requires=mpd.service
+After=mpd.service
+StartLimitIntervalSec=0
+
+[Container]
+ContainerName=upmpdcli
+Image={{ mpd_upnp_image }}
+# Host network is required, not a convenience: SSDP discovery multicasts on
+# the real LAN interface, and the control point connects straight to the
+# advertised host IP.
+Network=host
+Volume={{ mpd_upnp_base_dir }}/etc/upmpdcli.conf:/etc/upmpdcli.conf:ro,z
+Volume={{ mpd_upnp_base_dir }}/state/upmpdcli:/var/cache/upmpdcli:Z
+Exec=upmpdcli -c /etc/upmpdcli.conf
+
+[Service]
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

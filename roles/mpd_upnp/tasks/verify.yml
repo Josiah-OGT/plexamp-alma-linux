@@ -1,0 +1,26 @@
+---
+# Unlike Plexamp there is no claiming and no web UI — everything is config
+# in this role, so the leftovers are phone-side setup and the one check
+# Ansible can't do: actually playing audio and reading hw_params.
+- name: Show post-install steps
+  ansible.builtin.debug:
+    msg:
+      - "MPD + upmpdcli renderer '{{ mpd_upnp_friendly_name }}' is up on {{ inventory_hostname }}."
+      - ""
+      - "Symfonium setup:"
+      - "  1. Add your Navidrome server as a provider (Subsonic API) if it isn't already."
+      - "  2. Tap the cast icon — '{{ mpd_upnp_friendly_name }}' appears twice: pick the"
+      - "     OpenHome entry (gapless, renderer-held queue that survives the phone"
+      - "     sleeping); the plain UPnP one is the fallback."
+      - "  3. In the renderer's settings in Symfonium, make sure transcoding is off so"
+      - "     FLAC leaves Navidrome untouched."
+      - ""
+      - "Bit-perfect on real hardware (defaults are VM-safe, not bit-perfect):"
+      - "  - Find the DAC with `aplay -l`, then set mpd_upnp_alsa_device: \"hw:X,0\""
+      - "    and rerun — 'default' routes through dmix, which resamples."
+      - "  - Verify with: cat /proc/asound/cardX/pcm0p/sub0/hw_params while a track"
+      - "    plays; rate must match the source file. Replay a different-sample-rate"
+      - "    track and re-check — it should change too, proving it's switching."
+      - ""
+      - "Note: the box pulls streams from Navidrome itself — whatever URL Symfonium"
+      - "uses for Navidrome must be reachable from this host, not just from the phone."

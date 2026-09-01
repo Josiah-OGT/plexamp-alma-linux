@@ -1,0 +1,14 @@
+---
+galaxy_info:
+  role_name: mpd_upnp
+  description: >-
+    MPD + upmpdcli UPnP/OpenHome renderer (podman quadlets) for casting from
+    Symfonium/Navidrome on RHEL-family hosts
+  min_ansible_version: "2.15"
+  platforms:
+    - name: EL
+      versions:
+        - "10"
+
+collections:
+  - ansible.posix

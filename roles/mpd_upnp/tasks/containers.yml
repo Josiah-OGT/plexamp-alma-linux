@@ -1,0 +1,29 @@
+---
+- name: Install podman quadlet units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/containers/systemd/{{ item }}"
+    mode: "0644"
+  loop:
+    - mpd.container
+    - upmpdcli.container
+  register: mpd_upnp_quadlets
+  # upmpdcli.service Requires= mpd.service, so a restart of mpd propagates —
+  # notifying both is safe, not a double restart.
+  notify:
+    - restart mpd
+    - restart upmpdcli
+
+# Quadlet units become systemd services only after a daemon-reload.
+- name: Reload systemd so quadlet services are generated
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: mpd_upnp_quadlets is changed
+
+- name: Start the containers (enablement is static via the units' [Install])
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+  loop:
+    - mpd.service
+    - upmpdcli.service

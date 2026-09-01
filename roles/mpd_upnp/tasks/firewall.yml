@@ -1,0 +1,48 @@
+---
+# Scoped to LAN via rich rules (not the plain `port:` param, which would
+# open these to the whole zone regardless of source). Same stale-rule
+# cleanup pattern as plexamp_headless: the firewalld module only ever
+# *adds* rules, so a changed CIDR would leave the old one behind as an
+# overly-permissive leftover — a marker file tracks what was last applied.
+- name: Check previously applied LAN CIDR
+  ansible.builtin.slurp:
+    src: /etc/mpd-upnp-lan-cidr
+  register: mpd_upnp_prev_cidr_raw
+  failed_when: false
+
+- name: Remove rich rules for a previous LAN CIDR
+  when:
+    - mpd_upnp_prev_cidr_raw.content is defined
+    - (mpd_upnp_prev_cidr_raw.content | b64decode | trim) != mpd_upnp_lan_cidr
+  ansible.posix.firewalld:
+    rich_rule: >-
+      rule family="ipv4"
+      source address="{{ mpd_upnp_prev_cidr_raw.content | b64decode | trim }}"
+      port port="{{ item.port }}" protocol="{{ item.proto }}"
+      accept
+    permanent: true
+    immediate: true
+    state: disabled
+  loop: "{{ mpd_upnp_firewall_ports }}"
+  loop_control:
+    label: "{{ item.port }}/{{ item.proto }}"
+
+- name: Allow UPnP control and SSDP discovery from LAN only
+  ansible.posix.firewalld:
+    rich_rule: >-
+      rule family="ipv4"
+      source address="{{ mpd_upnp_lan_cidr }}"
+      port port="{{ item.port }}" protocol="{{ item.proto }}"
+      accept
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ mpd_upnp_firewall_ports }}"
+  loop_control:
+    label: "{{ item.port }}/{{ item.proto }}"
+
+- name: Record applied LAN CIDR
+  ansible.builtin.copy:
+    content: "{{ mpd_upnp_lan_cidr }}"
+    dest: /etc/mpd-upnp-lan-cidr
+    mode: "0644"

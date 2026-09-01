@@ -1,0 +1,20 @@
+---
+- name: Install podman, firewalld and audio tooling
+  ansible.builtin.dnf:
+    name:
+      - podman
+      - firewalld
+      - alsa-utils          # aplay -l to identify the DAC; hw_params checks
+      - python3-libselinux
+    state: present
+
+- name: Ensure firewalld is running
+  ansible.builtin.systemd:
+    name: firewalld
+    enabled: true
+    state: started
+
+# No SELinux tasks needed, and that's verified, not assumed: with enforcing
+# mode on and container_use_devices explicitly OFF, MPD still opens the
+# AddDevice'd /dev/snd fine — podman relabels the device nodes it maps into
+# the container, and quadlet's :z/:Z volume flags handle the bind mounts.

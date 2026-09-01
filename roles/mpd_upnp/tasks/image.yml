@@ -1,0 +1,32 @@
+---
+- name: Create build context directory
+  ansible.builtin.file:
+    path: "{{ mpd_upnp_base_dir }}/build"
+    state: directory
+    mode: "0755"
+
+- name: Template the Containerfile
+  ansible.builtin.template:
+    src: Containerfile.j2
+    dest: "{{ mpd_upnp_base_dir }}/build/Containerfile"
+    mode: "0644"
+  register: mpd_upnp_containerfile
+
+- name: Check whether the image is already built
+  ansible.builtin.command: "podman image exists {{ mpd_upnp_image }}"
+  register: mpd_upnp_img_check
+  changed_when: false
+  failed_when: false
+
+# Rebuild only when the Containerfile changed or the image is missing —
+# `podman build` against an unchanged context would still churn through
+# apt-get on every run otherwise. Package updates inside the image are
+# picked up by editing/touching the Containerfile (or `podman rmi` + rerun).
+- name: Build the mpd+upmpdcli image
+  ansible.builtin.command: >-
+    podman build -t {{ mpd_upnp_image }} {{ mpd_upnp_base_dir }}/build
+  when: mpd_upnp_containerfile is changed or mpd_upnp_img_check.rc != 0
+  changed_when: true
+  notify:
+    - restart mpd
+    - restart upmpdcli

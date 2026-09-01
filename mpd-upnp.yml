@@ -1,0 +1,12 @@
+---
+- name: Deploy MPD + upmpdcli UPnP renderer for Navidrome/Symfonium
+  hosts: mpd_upnp_endpoint
+  become: true
+
+  roles:
+    - role: mpd_upnp
+      vars:
+        mpd_upnp_lan_cidr: "CHANGE_ME/24"        # set to your actual LAN subnet
+        # mpd_upnp_alsa_device: "hw:1,0"     # your USB DAC (aplay -l); default
+        #                                    # is dmix, which is NOT bit-perfect
+        # mpd_upnp_friendly_name: "Hifi DAC" # name shown in Symfonium's cast menu

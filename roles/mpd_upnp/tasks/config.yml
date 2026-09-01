@@ -1,0 +1,28 @@
+---
+- name: Create config and state directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ mpd_upnp_base_dir }}/etc"
+    - "{{ mpd_upnp_base_dir }}/state/mpd"
+    # music/ stays empty (streams only) and playlists/ likely unused, but
+    # MPD throws startup exceptions into the log if they don't exist.
+    - "{{ mpd_upnp_base_dir }}/state/mpd/music"
+    - "{{ mpd_upnp_base_dir }}/state/mpd/playlists"
+    - "{{ mpd_upnp_base_dir }}/state/upmpdcli"
+
+- name: Deploy mpd.conf
+  ansible.builtin.template:
+    src: mpd.conf.j2
+    dest: "{{ mpd_upnp_base_dir }}/etc/mpd.conf"
+    mode: "0644"
+  notify: restart mpd
+
+- name: Deploy upmpdcli.conf
+  ansible.builtin.template:
+    src: upmpdcli.conf.j2
+    dest: "{{ mpd_upnp_base_dir }}/etc/upmpdcli.conf"
+    mode: "0644"
+  notify: restart upmpdcli
