@@ -118,8 +118,15 @@ Subsonic-compatible server) and you drive it from
 **UPnP/OpenHome renderer**: MPD as the playback engine, fronted by
 [upmpdcli](https://www.lesbonscomptes.com/upmpdcli/). Symfonium casts to it,
 the box pulls the FLAC straight from Navidrome, and MPD plays it out the DAC
-with no resampling. It coexists with Plexamp — they just can't both hold the
-ALSA device at the same instant.
+with no resampling.
+
+**It cannot share a DAC with Plexamp.** Headless Plexamp opens its ALSA
+output device at service start and holds it open for as long as it runs,
+idle or not — so with both services enabled, whichever one starts first
+wins the DAC and the other fails every track with `Failed to open ALSA
+device ...: Device or resource busy`. Pick one per DAC:
+`sudo systemctl disable --now plexamp` to hand the device to MPD (and
+`enable --now` to hand it back). Both can stay installed; only one can run.
 
 Neither MPD nor upmpdcli is packaged anywhere for EL10 (EPEL 10, RPM Fusion
 EL10, COPR and upstream were all checked — nothing), so the role builds a
