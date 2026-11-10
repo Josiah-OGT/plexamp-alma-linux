@@ -1,0 +1,966 @@
+#!/usr/bin/python3
+"""audioctl - start/stop the audio engines and route DACs between them.
+
+Two engines can drive the box's DACs:
+  Plexamp   plexamp.service           one DAC, held open the whole time it runs
+  MPD/UPnP  mpd + upmpdcli quadlets   any number of DACs (one MPD audio_output each)
+
+A DAC is routed to at most one of them: Plexamp opens its DAC exclusively
+at start, so a DAC MPD also plays to fails with "Device or resource busy".
+audioctl keeps the routing exclusive, so both engines can run at once on
+different DACs.
+
+Run with no arguments for the TUI. `audioctl --help` lists the CLI.
+"""
+
+import argparse
+import curses
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+
+CONFIG_PATH = os.environ.get("AUDIOCTL_CONFIG", "/etc/audioctl.json")
+DEFAULTS = {
+    "asound_dir": "/proc/asound",
+    "state_file": "/var/lib/audioctl/state.json",
+    "plexamp_unit": "plexamp.service",
+    "plexamp_settings_dir": "/opt/plexamp/.local/share/Plexamp/Settings",
+    "mpd_units": ["mpd.service", "upmpdcli.service"],
+    "mpd_conf": "/opt/mpd-upnp/etc/mpd.conf",
+    "mpd_state_file": "/opt/mpd-upnp/state/mpd/state",
+    "mpd_container": "mpd",
+}
+# Plexamp keeps each setting in its own file; values carry a type prefix
+# ("S" string, "N" number). The device is stored as an ALSA name, "hw:0,0".
+PLEX_DEVICE_FILE = "%40Plexamp%3Asettings%3AaudioDeviceUuid"
+
+
+class Error(Exception):
+    pass
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def run(cmd, check=True):
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        detail = (p.stderr or p.stdout).strip() or f"exit {p.returncode}"
+        raise Error(f"{' '.join(cmd)}: {detail}")
+    return p
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise Error("this needs root - run it with sudo")
+
+
+# --------------------------------------------------------------------------
+# ALSA cards
+# --------------------------------------------------------------------------
+
+@dataclass
+class Card:
+    index: int
+    id: str             # stable name, as in hw:CARD=<id>
+    desc: str
+    pcms: list          # playback PCM device numbers
+    state: str = "closed"   # closed / RUNNING / PREPARED / ...
+    rate: int = 0
+    fmt: str = ""
+    owner: str = ""     # unit (or process) holding the device open
+
+    @property
+    def device(self):
+        """The ALSA name Plexamp itself writes (hw:<card#>,<pcm#>)."""
+        return f"hw:{self.index},{self.pcms[0] if self.pcms else 0}"
+
+
+CARD_RE = re.compile(r"^\s*(\d+)\s+\[(\S+)\s*\]:\s*(.*)$")
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def pid_owner(pid):
+    cg = _read(f"/proc/{pid}/cgroup")
+    m = re.findall(r"/([\w@.\\-]+)\.service", cg)
+    if m:
+        return m[-1]
+    return _read(f"/proc/{pid}/comm").strip() or f"pid {pid}"
+
+
+def read_cards(cfg):
+    base = cfg["asound_dir"]
+    lines = _read(os.path.join(base, "cards")).splitlines()
+    cards = []
+    for i, line in enumerate(lines):
+        m = CARD_RE.match(line)
+        if not m:
+            continue
+        idx, cid = int(m.group(1)), m.group(2)
+        desc = lines[i + 1].strip() if i + 1 < len(lines) else m.group(3)
+        desc = re.sub(r"\s+at\s+\S+.*$", "", desc) or m.group(3)
+        cdir = os.path.join(base, f"card{idx}")
+        try:
+            names = os.listdir(cdir)
+        except OSError:
+            names = []
+        pcms = sorted(int(n[3:-1]) for n in names if re.fullmatch(r"pcm\d+p", n))
+        card = Card(idx, cid, desc, pcms)
+        for pcm in pcms:
+            sub = os.path.join(cdir, f"pcm{pcm}p", "sub0")
+            status = _read(os.path.join(sub, "status"))
+            sm = re.search(r"^state:\s*(\S+)", status, re.M)
+            if not sm:
+                continue
+            card.state = sm.group(1)
+            om = re.search(r"^owner_pid\s*:\s*(\d+)", status, re.M)
+            if om:
+                card.owner = pid_owner(om.group(1))
+            hw = _read(os.path.join(sub, "hw_params"))
+            rm = re.search(r"^rate:\s*(\d+)", hw, re.M)
+            fm = re.search(r"^format:\s*(\S+)", hw, re.M)
+            card.rate = int(rm.group(1)) if rm else 0
+            card.fmt = fm.group(1) if fm else ""
+            break
+        cards.append(card)
+    return cards
+
+
+def device_card_ref(dev):
+    """'hw:CARD=Card,DEV=0' / 'plughw:1,0' / 'hw:Card' -> 'Card' / '1'; else None."""
+    m = re.match(r"^(?:plug)?hw:(.+)$", (dev or "").strip())
+    if not m:
+        return None
+    first = m.group(1).split(",")[0]
+    return first[5:] if first.startswith("CARD=") else first
+
+
+def find_card(cards, ref):
+    if ref is None:
+        return None
+    for c in cards:
+        if (ref.isdigit() and c.index == int(ref)) or c.id == ref:
+            return c
+    return None
+
+
+# --------------------------------------------------------------------------
+# systemd engines
+# --------------------------------------------------------------------------
+
+@dataclass
+class Engine:
+    key: str
+    label: str
+    units: list
+    boot_method: str            # "enable" (normal unit) or "mask" (quadlet)
+    props: dict = field(default_factory=dict)
+
+    def _all(self, pred):
+        return all(pred(self.props.get(u, {})) for u in self.units)
+
+    def _any(self, pred):
+        return any(pred(self.props.get(u, {})) for u in self.units)
+
+    @property
+    def installed(self):
+        return self._any(lambda p: p.get("LoadState") not in (None, "not-found"))
+
+    @property
+    def active(self):
+        return self._all(lambda p: p.get("ActiveState") == "active")
+
+    @property
+    def running(self):         # any unit up = holding (or about to hold) a DAC
+        return self._any(lambda p: p.get("ActiveState") in ("active", "activating", "reloading"))
+
+    @property
+    def failed(self):
+        return self._any(lambda p: p.get("ActiveState") == "failed")
+
+    def _masked(self, p):
+        return "masked" in (p.get("LoadState"), p.get("UnitFileState"))
+
+    @property
+    def masked_units(self):
+        return [u for u in self.units if self._masked(self.props.get(u, {}))]
+
+    @property
+    def boot(self):
+        if self.boot_method == "mask":
+            return not self.masked_units
+        return self._all(lambda p: p.get("UnitFileState") in
+                         ("enabled", "enabled-runtime", "static", "alias", "generated"))
+
+    @property
+    def status(self):
+        if not self.installed:
+            return "not installed"
+        if self.failed:
+            return "failed"
+        if self.active:
+            return "running"
+        if self.running:
+            return "starting"
+        return "stopped"
+
+
+def read_engines(cfg):
+    engines = {
+        "plexamp": Engine("plexamp", "Plexamp", [cfg["plexamp_unit"]], "enable"),
+        "mpd": Engine("mpd", "MPD/UPnP", list(cfg["mpd_units"]), "mask"),
+    }
+    units = [u for e in engines.values() for u in e.units]
+    out = run(["systemctl", "show", "--no-pager",
+               "-p", "Id,LoadState,ActiveState,SubState,UnitFileState", "--", *units],
+              check=False).stdout
+    blocks = [b for b in out.strip().split("\n\n") if b.strip()]
+    props = {}
+    for unit, block in zip(units, blocks):
+        props[unit] = dict(l.split("=", 1) for l in block.splitlines() if "=" in l)
+    for e in engines.values():
+        e.props = {u: props.get(u, {}) for u in e.units}
+    return engines
+
+
+def systemctl(*args):
+    run(["systemctl", *args])
+
+
+# --------------------------------------------------------------------------
+# MPD outputs
+# --------------------------------------------------------------------------
+
+@dataclass
+class Output:
+    num: int            # mpc's 1-based output number (config order)
+    name: str
+    device: str
+    enabled: bool = True
+
+
+def read_mpd_outputs(cfg, mpd_running):
+    text = _read(cfg["mpd_conf"])
+    outs = []
+    for i, block in enumerate(re.finditer(r"audio_output\s*\{(.*?)\n\s*\}", text, re.S), 1):
+        kv = dict(re.findall(r'^\s*(\w+)\s+"([^"]*)"', block.group(1), re.M))
+        if kv.get("type") != "alsa":
+            continue
+        outs.append(Output(i, kv.get("name", f"output {i}"), kv.get("device", "default"),
+                           kv.get("enabled", "yes") != "no"))
+    states = None
+    if mpd_running:
+        p = run(["podman", "exec", cfg["mpd_container"], "mpc", "outputs"], check=False)
+        if p.returncode == 0:
+            states = {}
+            for m in re.finditer(r"^Output (\d+) \((.*)\) is (enabled|disabled)$", p.stdout, re.M):
+                states[m.group(2)] = (int(m.group(1)), m.group(3) == "enabled")
+    if states is None:
+        # MPD down (or no root for podman): read what it will come back with.
+        states = {}
+        for m in re.finditer(r"^audio_device_state:(\d):(.*)$", _read(cfg["mpd_state_file"]), re.M):
+            states[m.group(2)] = (None, m.group(1) == "1")
+    for o in outs:
+        if o.name in states:
+            num, o.enabled = states[o.name]
+            o.num = num or o.num
+    return outs
+
+
+def mpc(cfg, *args):
+    """mpc inside the container, retrying while a just-started MPD comes up."""
+    deadline = time.monotonic() + 10
+    while True:
+        p = run(["podman", "exec", cfg["mpd_container"], "mpc", *args], check=False)
+        if p.returncode == 0:
+            return p
+        if time.monotonic() > deadline:
+            raise Error(f"mpc {' '.join(args)}: {(p.stderr or p.stdout).strip()}")
+        time.sleep(0.5)
+
+
+def mpd_set_output(cfg, snap, out, on):
+    if snap.engines["mpd"].running:
+        mpc(cfg, "enable" if on else "disable", str(out.num))
+    else:
+        # MPD restores per-output state by name from its state file at start.
+        path = cfg["mpd_state_file"]
+        try:
+            st = os.stat(path)
+            text = _read(path)
+        except OSError:
+            raise Error("MPD is stopped and has no state file yet - start it once first")
+        line = f"audio_device_state:{int(on)}:{out.name}"
+        pat = re.compile(rf"^audio_device_state:\d:{re.escape(out.name)}$", re.M)
+        text = pat.sub(line, text) if pat.search(text) else line + "\n" + text
+        tmp = path + ".audioctl"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.chown(tmp, st.st_uid, st.st_gid)
+        os.chmod(tmp, st.st_mode & 0o7777)
+        os.replace(tmp, path)
+    out.enabled = on
+
+
+# --------------------------------------------------------------------------
+# Plexamp device + audioctl's own state
+# --------------------------------------------------------------------------
+
+def load_state(cfg):
+    try:
+        with open(cfg["state_file"]) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(cfg, state):
+    os.makedirs(os.path.dirname(cfg["state_file"]), exist_ok=True)
+    tmp = cfg["state_file"] + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, cfg["state_file"])
+
+
+def plex_device(cfg):
+    raw = _read(os.path.join(cfg["plexamp_settings_dir"], PLEX_DEVICE_FILE)).strip()
+    return raw[1:] if raw.startswith("S") else (raw or None)
+
+
+def plex_write_device(cfg, dev):
+    d = cfg["plexamp_settings_dir"]
+    if not os.path.isdir(d):
+        raise Error(f"{d} missing - claim Plexamp (see the plexamp_headless role output) first")
+    st = os.stat(d)
+    path = os.path.join(d, PLEX_DEVICE_FILE)
+    tmp = path + ".audioctl"
+    with open(tmp, "w") as f:
+        f.write("S" + dev)
+    os.chown(tmp, st.st_uid, st.st_gid)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def plexamp_sync(cfg, cards=None, quiet=False):
+    """Point Plexamp's setting at the assigned DAC's *current* card number.
+
+    Plexamp stores hw:<card#>,<pcm#>, and card numbers follow USB enumeration
+    order, which can change between boots. audioctl remembers the DAC by its
+    stable id instead and rewrites the number before every Plexamp start
+    (ExecStartPre drop-in), so a reshuffle can't send Plexamp to the wrong DAC.
+    """
+    state = load_state(cfg)
+    if "plexamp_card" not in state or not state["plexamp_card"]:
+        return None              # never routed by audioctl: leave the web UI's choice
+    cards = cards if cards is not None else read_cards(cfg)
+    card = find_card(cards, state["plexamp_card"])
+    if not card:
+        if not quiet:
+            print(f"audioctl: Plexamp's DAC '{state['plexamp_card']}' is not connected; "
+                  "leaving its device setting unchanged", file=sys.stderr)
+        return None
+    if plex_device(cfg) != card.device:
+        plex_write_device(cfg, card.device)
+        if not quiet:
+            print(f"audioctl: Plexamp device -> {card.device} ({card.id})", file=sys.stderr)
+    return card
+
+
+# --------------------------------------------------------------------------
+# Snapshot of the whole box
+# --------------------------------------------------------------------------
+
+@dataclass
+class Snapshot:
+    cards: list
+    engines: dict
+    outputs: list
+    plex_card_id: str       # DAC routed to Plexamp (id), or None
+    plex_card_dangling: bool  # assigned DAC not connected right now
+
+    def output_for(self, card):
+        for o in self.outputs:
+            if find_card(self.cards, device_card_ref(o.device)) is card:
+                return o
+        return None
+
+    def card(self, ref):
+        c = find_card(self.cards, ref)
+        if not c:
+            for o in self.outputs:          # also accept the MPD output name
+                if o.name.lower() == ref.lower():
+                    c = find_card(self.cards, device_card_ref(o.device))
+        if not c:
+            raise Error(f"no DAC '{ref}' (have: {', '.join(c.id for c in self.cards)})")
+        return c
+
+    def plex_card(self):
+        return find_card(self.cards, self.plex_card_id)
+
+    def routes(self, card):
+        r = []
+        o = self.output_for(card)
+        if o and o.enabled and self.engines["mpd"].installed:
+            r.append("mpd")
+        if self.plex_card_id == card.id and self.engines["plexamp"].installed:
+            r.append("plexamp")
+        return r
+
+
+def snapshot(cfg):
+    cards = read_cards(cfg)
+    engines = read_engines(cfg)
+    outputs = read_mpd_outputs(cfg, engines["mpd"].running) if engines["mpd"].installed else []
+    state = load_state(cfg)
+    if "plexamp_card" in state:
+        plex_id = state["plexamp_card"]
+    else:  # not routed through audioctl yet: report what Plexamp's web UI chose
+        c = find_card(cards, device_card_ref(plex_device(cfg)))
+        plex_id = c.id if c else None
+    dangling = bool(plex_id) and not find_card(cards, plex_id)
+    return Snapshot(cards, engines, outputs, plex_id, dangling)
+
+
+# --------------------------------------------------------------------------
+# Actions. Each returns a list of human-readable notes about what it did.
+# --------------------------------------------------------------------------
+
+def _start_units(eng):
+    masked = eng.masked_units
+    if masked:
+        # Boot-disabled quadlet: lift the mask just long enough to start it,
+        # so "running now, but not at boot" is still possible.
+        systemctl("unmask", *masked)
+        try:
+            systemctl("start", *eng.units)
+        finally:
+            systemctl("mask", *masked)
+    else:
+        systemctl("start", *eng.units)
+
+
+def start(cfg, key):
+    require_root()
+    snap = snapshot(cfg)
+    eng = snap.engines[key]
+    notes = []
+    if not eng.installed:
+        raise Error(f"{eng.label} is not installed")
+    if key == "plexamp":
+        card = snap.plex_card()
+        if not card:
+            raise Error("Plexamp has no DAC" + (f" ('{snap.plex_card_id}' is unplugged)"
+                        if snap.plex_card_dangling else " - route one to it first"))
+        out = snap.output_for(card)
+        if out and out.enabled:
+            mpd_set_output(cfg, snap, out, False)
+            notes.append(f"{card.id} removed from MPD so Plexamp can open it")
+        plexamp_sync(cfg, snap.cards, quiet=True)
+        _start_units(eng)
+        notes.append(f"Plexamp started on {card.id}")
+    else:
+        _start_units(eng)
+        notes.append(f"{eng.label} started")
+        if snap.engines["plexamp"].running and snap.plex_card():
+            out = snap.output_for(snap.plex_card())
+            if out and out.enabled:
+                mpd_set_output(cfg, snapshot(cfg), out, False)
+                notes.append(f"{out.name} disabled in MPD: Plexamp holds {snap.plex_card_id}")
+    return notes
+
+
+def stop(cfg, key):
+    require_root()
+    eng = snapshot(cfg).engines[key]
+    systemctl("stop", *reversed(eng.units))
+    return [f"{eng.label} stopped"]
+
+
+def restart(cfg, key):
+    stop(cfg, key)
+    return start(cfg, key)
+
+
+def set_boot(cfg, key, on):
+    require_root()
+    eng = snapshot(cfg).engines[key]
+    if eng.boot_method == "mask":
+        # Quadlet units are generated; their [Install] can't be disabled, only masked.
+        if on:
+            if eng.masked_units:
+                systemctl("unmask", *eng.masked_units)
+        else:
+            systemctl("mask", *eng.units)
+    else:
+        systemctl("enable" if on else "disable", *eng.units)
+    return [f"{eng.label} {'starts' if on else 'no longer starts'} at boot"]
+
+
+def route(cfg, ref, target):
+    require_root()
+    snap = snapshot(cfg)
+    card = snap.card(ref)
+    out = snap.output_for(card)
+    plex = snap.engines["plexamp"]
+    state = load_state(cfg)
+    notes = []
+
+    def take_from_plexamp():
+        if snap.plex_card_id == card.id:
+            state["plexamp_card"] = None
+            save_state(cfg, state)
+            if plex.running:
+                systemctl("stop", *plex.units)
+                notes.append(f"Plexamp stopped (it was on {card.id})")
+
+    if target == "mpd":
+        if not snap.engines["mpd"].installed:
+            raise Error("MPD/UPnP is not installed")
+        if not out:
+            raise Error(f"MPD has no output for {card.id} - add "
+                        f'{{ name: ..., device: "hw:CARD={card.id}" }} to '
+                        "mpd_upnp_alsa_outputs and redeploy mpd-upnp.yml")
+        take_from_plexamp()
+        if not out.enabled:
+            mpd_set_output(cfg, snap, out, True)
+        notes.append(f"{card.id} -> MPD ({out.name})")
+    elif target == "plexamp":
+        if not plex.installed:
+            raise Error("Plexamp is not installed")
+        if out and out.enabled:
+            mpd_set_output(cfg, snap, out, False)
+            notes.append(f"{out.name} disabled in MPD")
+        prev = snap.plex_card_id
+        state["plexamp_card"] = card.id
+        save_state(cfg, state)
+        if plex.running:
+            systemctl("stop", *plex.units)
+            plexamp_sync(cfg, snap.cards, quiet=True)
+            systemctl("start", *plex.units)
+            notes.append("Plexamp restarted")
+        else:
+            plexamp_sync(cfg, snap.cards, quiet=True)
+        notes.append(f"{card.id} -> Plexamp" + (f" ({prev} released)" if prev and prev != card.id else ""))
+    elif target == "off":
+        if out and out.enabled:
+            mpd_set_output(cfg, snap, out, False)
+        take_from_plexamp()
+        notes.append(f"{card.id} unrouted")
+    else:
+        raise Error(f"unknown target {target!r}")
+    return notes
+
+
+def mpd_only(cfg, ref):
+    notes = route(cfg, ref, "mpd")
+    snap = snapshot(cfg)
+    card = snap.card(ref)
+    for o in snap.outputs:
+        if o.enabled and snap.output_for(card) is not o:
+            mpd_set_output(cfg, snap, o, False)
+    return notes + [f"MPD plays only to {card.id}"]
+
+
+def mpd_all(cfg):
+    require_root()
+    snap = snapshot(cfg)
+    plex = snap.engines["plexamp"]
+    notes = []
+    for o in snap.outputs:
+        card = find_card(snap.cards, device_card_ref(o.device))
+        if card and card.id == snap.plex_card_id and (plex.running or plex.boot):
+            notes.append(f"{card.id} kept on Plexamp")
+            continue
+        if card and card.id == snap.plex_card_id:
+            notes += route(cfg, card.id, "mpd")
+        elif not o.enabled:
+            mpd_set_output(cfg, snap, o, True)
+    return notes + ["MPD plays to all its DACs"]
+
+
+# --------------------------------------------------------------------------
+# Text status
+# --------------------------------------------------------------------------
+
+def fmt_rate(r):
+    return f"{r / 1000:g} kHz" if r else ""
+
+
+def card_now(c):
+    if c.state == "closed":
+        return "closed"
+    bits = [{"RUNNING": "playing"}.get(c.state, c.state.lower())]
+    if c.rate:
+        bits.append(f"{fmt_rate(c.rate)} {c.fmt}")
+    if c.owner:
+        bits.append(c.owner)
+    return "  ".join(bits)
+
+
+def route_label(snap, card):
+    r = snap.routes(card)
+    names = []
+    for k in r:
+        e = snap.engines[k]
+        n = "MPD" if k == "mpd" else "Plexamp"
+        names.append(n if e.running else f"{n} (stopped)")
+    label = " + ".join(names) or "-"
+    conflict = len(r) == 2 and all(snap.engines[k].running for k in r)
+    return label, conflict
+
+
+def status_dict(snap):
+    return {
+        "engines": {k: {"label": e.label, "status": e.status, "boot": e.boot,
+                        "units": {u: e.props.get(u, {}).get("ActiveState") for u in e.units}}
+                    for k, e in snap.engines.items()},
+        "dacs": [{"id": c.id, "card": c.index, "desc": c.desc, "routes": snap.routes(c),
+                  "mpd_output": (snap.output_for(c).name if snap.output_for(c) else None),
+                  "state": c.state, "rate": c.rate, "format": c.fmt, "owner": c.owner}
+                 for c in snap.cards],
+        "plexamp_dac": snap.plex_card_id,
+    }
+
+
+def print_status(snap):
+    for e in snap.engines.values():
+        print(f"{e.label:<10} {e.status:<14} boot: {'on' if e.boot else 'off'}")
+    print()
+    print(f"{'DAC':<8} {'Routed to':<26} {'Now':<36} Description")
+    for c in snap.cards:
+        label, conflict = route_label(snap, c)
+        if conflict:
+            label += "  CONFLICT"
+        print(f"{c.id:<8} {label:<26} {card_now(c):<36} {c.desc}")
+    if snap.plex_card_dangling:
+        print(f"\nPlexamp's DAC '{snap.plex_card_id}' is not connected.")
+
+
+# --------------------------------------------------------------------------
+# TUI
+# --------------------------------------------------------------------------
+
+HELP = """\
+ audioctl - keys
+
+ Up/Down, j/k   move           Tab   jump between Engines and DACs
+ Enter          menu for the selected row
+ q              quit           ?     this help
+
+ On an engine row:
+   s   start / stop            r     restart
+   b   toggle start-at-boot
+
+ On a DAC row:
+   m   route to MPD (added to whatever MPD already plays to)
+   1   MPD plays to this DAC only
+   a   MPD plays to all its DACs (except the one Plexamp is using)
+   p   route to Plexamp (Plexamp drives exactly one DAC)
+   o   unroute
+
+ A DAC goes to one engine at a time: Plexamp holds its DAC open the whole
+ time it runs, so routing keeps MPD off it. Both engines can then run at
+ once on different DACs.
+"""
+
+
+class TUI:
+    def __init__(self, scr, cfg):
+        self.scr, self.cfg = scr, cfg
+        self.sel = 0
+        self.msg, self.msg_err = "", False
+        self.snap = None
+        self.last = 0
+        self.help = False
+        curses.curs_set(0)
+        scr.timeout(500)
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            for i, col in enumerate((curses.COLOR_GREEN, curses.COLOR_RED,
+                                     curses.COLOR_YELLOW, curses.COLOR_CYAN), 1):
+                curses.init_pair(i, col, -1)
+        self.GREEN, self.RED, self.YELLOW, self.CYAN = (curses.color_pair(i) for i in range(1, 5))
+
+    def rows(self):
+        eng = [("engine", e) for e in self.snap.engines.values() if e.installed]
+        return eng + [("dac", c) for c in self.snap.cards]
+
+    def refresh(self):
+        try:
+            self.snap = snapshot(self.cfg)
+        except Error as e:
+            self.flash(str(e), True)
+        self.last = time.monotonic()
+
+    def flash(self, text, err=False):
+        self.msg, self.msg_err = text, err
+
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h and x < w:
+            try:
+                self.scr.addnstr(y, x, text, w - x - 1, attr)
+            except curses.error:
+                pass
+
+    def section(self, y, title):
+        h, w = self.scr.getmaxyx()
+        self.put(y, 0, "─" * (w - 1), curses.A_DIM)
+        self.put(y, 2, f" {title} ", self.CYAN | curses.A_BOLD)
+
+    def draw(self):
+        s = self.scr
+        s.erase()
+        h, w = s.getmaxyx()
+        if self.help:
+            for i, line in enumerate(HELP.splitlines()):
+                self.put(i, 0, line)
+            self.put(h - 1, 1, "any key to close", curses.A_DIM)
+            s.refresh()
+            return
+        host = os.uname().nodename
+        self.put(0, 1, "audioctl", curses.A_BOLD)
+        self.put(0, 10, f"- {host}", curses.A_DIM)
+        self.put(0, max(w - 17, 0), "? help   q quit", curses.A_DIM)
+        rows = self.rows()
+        self.sel = min(self.sel, len(rows) - 1)
+        y = 2
+        self.section(y, "Engines")
+        y += 1
+        snap = self.snap
+        for i, (kind, item) in enumerate(rows):
+            if kind == "dac" and rows[i - 1][0] != "dac":
+                y += 1
+                self.section(y, "DACs")
+                y += 1
+                self.put(y, 4, f"{'DAC':<8}{'Routed to':<26}{'Now':<32}Description", curses.A_DIM)
+                y += 1
+            mark = "▶ " if i == self.sel else "  "
+            hl = curses.A_REVERSE if i == self.sel else 0
+            self.put(y, 1, mark, curses.A_BOLD)
+            if kind == "engine":
+                e = item
+                col = {"running": self.GREEN, "failed": self.RED,
+                       "starting": self.YELLOW}.get(e.status, curses.A_DIM)
+                self.put(y, 4, f"{e.label:<10}", hl | curses.A_BOLD)
+                self.put(y, 15, f"● {e.status:<9}", col)
+                self.put(y, 27, f"boot: {'on ' if e.boot else 'off'}",
+                         0 if e.boot else curses.A_DIM)
+                if e.key == "plexamp":
+                    dac = snap.plex_card_id or "none"
+                    if snap.plex_card_dangling:
+                        dac += " (unplugged)"
+                else:
+                    dac = ", ".join(c.id for c in snap.cards if "mpd" in snap.routes(c)) or "none"
+                self.put(y, 38, f"DAC: {dac}", curses.A_DIM if dac.startswith("none") else 0)
+                states = {e.props.get(u, {}).get("ActiveState") for u in e.units}
+                if len(states) > 1:   # mixed: say which unit is which
+                    self.put(y, 62, "  ".join(f"{u.removesuffix('.service')}:"
+                                              f"{e.props.get(u, {}).get('ActiveState', '?')}"
+                                              for u in e.units), self.YELLOW)
+            else:
+                c = item
+                label, conflict = route_label(snap, c)
+                self.put(y, 4, f"{c.id:<8}", hl | curses.A_BOLD)
+                attr = self.RED | curses.A_BOLD if conflict else \
+                    (curses.A_DIM if label == "-" or "stopped" in label else 0)
+                self.put(y, 12, f"{label + ('  ⚠' if conflict else ''):<26}"[:25], attr)
+                now = card_now(c)
+                self.put(y, 38, f"{now:<32}"[:31], self.GREEN if c.state == "RUNNING" else curses.A_DIM)
+                self.put(y, 70, c.desc, curses.A_DIM)
+            y += 1
+        # footer
+        kind = rows[self.sel][0] if rows else None
+        keys = ("s start/stop   r restart   b boot on/off   Enter menu" if kind == "engine" else
+                "m →MPD   1 MPD only this   a MPD all   p →Plexamp   o off   Enter menu")
+        self.put(h - 2, 1, keys, curses.A_DIM)
+        if self.msg:
+            self.put(h - 1, 1, self.msg, self.RED if self.msg_err else self.GREEN)
+        s.refresh()
+
+    def do(self, fn, *args):
+        self.flash("working…")
+        self.draw()
+        try:
+            notes = fn(self.cfg, *args)
+            self.flash("; ".join(notes))
+        except Error as e:
+            self.flash(str(e), True)
+        self.refresh()
+
+    def menu(self, title, options):
+        """Small popup; returns the chosen option's value or None."""
+        h, w = self.scr.getmaxyx()
+        width = min(max(len(title), *(len(o[0]) for o in options)) + 6, w - 2)
+        height = len(options) + 4
+        win = curses.newwin(height, width, max((h - height) // 2, 0), max((w - width) // 2, 0))
+        win.keypad(True)
+        sel = 0
+        while True:
+            win.erase()
+            win.box()
+            win.addnstr(0, 2, f" {title} ", width - 4, curses.A_BOLD)
+            for i, (label, _) in enumerate(options):
+                win.addnstr(i + 2, 2, f" {label} ".ljust(width - 4), width - 4,
+                            curses.A_REVERSE if i == sel else 0)
+            win.refresh()
+            k = win.getch()
+            if k in (curses.KEY_UP, ord("k")):
+                sel = (sel - 1) % len(options)
+            elif k in (curses.KEY_DOWN, ord("j")):
+                sel = (sel + 1) % len(options)
+            elif k in (10, 13, curses.KEY_ENTER):
+                return options[sel][1]
+            elif k in (27, ord("q")):
+                return None
+
+    def engine_action(self, e, key):
+        if key == "s":
+            self.do(stop if e.running else start, e.key)
+        elif key == "r":
+            self.do(restart, e.key)
+        elif key == "b":
+            self.do(set_boot, e.key, not e.boot)
+
+    def dac_action(self, c, key):
+        if key == "m":
+            self.do(route, c.id, "mpd")
+        elif key == "1":
+            self.do(mpd_only, c.id)
+        elif key == "a":
+            self.do(lambda cfg: mpd_all(cfg))
+        elif key == "p":
+            self.do(route, c.id, "plexamp")
+        elif key == "o":
+            self.do(route, c.id, "off")
+
+    def loop(self):
+        self.refresh()
+        while True:
+            if time.monotonic() - self.last > 2:
+                self.refresh()
+            self.draw()
+            k = self.scr.getch()
+            if k == -1:
+                continue
+            if self.help:
+                self.help = False
+                continue
+            rows = self.rows()
+            kind, item = rows[self.sel] if rows else (None, None)
+            ch = chr(k) if 0 <= k < 256 else ""
+            if ch == "q":
+                return
+            elif ch == "?":
+                self.help = True
+            elif k in (curses.KEY_UP,) or ch == "k":
+                self.sel = max(self.sel - 1, 0)
+            elif k in (curses.KEY_DOWN,) or ch == "j":
+                self.sel = min(self.sel + 1, len(rows) - 1)
+            elif ch == "\t":
+                first_dac = next((i for i, r in enumerate(rows) if r[0] == "dac"), 0)
+                self.sel = first_dac if kind == "engine" else 0
+            elif k == curses.KEY_RESIZE:
+                pass
+            elif k in (10, 13, curses.KEY_ENTER):
+                if kind == "engine":
+                    opts = [("Stop" if item.running else "Start", "s"), ("Restart", "r"),
+                            ("Don't start at boot" if item.boot else "Start at boot", "b")]
+                    choice = self.menu(item.label, opts)
+                    if choice:
+                        self.engine_action(item, choice)
+                elif kind == "dac":
+                    opts = [("Route to MPD (add)", "m"), ("MPD: only this DAC", "1"),
+                            ("MPD: all DACs", "a"), ("Route to Plexamp", "p"), ("Unroute", "o")]
+                    choice = self.menu(f"{item.id} - {item.desc}", opts)
+                    if choice:
+                        self.dac_action(item, choice)
+            elif kind == "engine" and ch in "srb":
+                self.engine_action(item, ch)
+            elif kind == "dac" and ch in "m1apo":
+                self.dac_action(item, ch)
+
+
+def tui(cfg):
+    if os.geteuid() != 0:
+        raise Error("the TUI changes services and routing - run it with sudo")
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(lambda scr: TUI(scr, cfg).loop())
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="audioctl", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("status", help="show engines and DAC routing")
+    p.add_argument("--json", action="store_true")
+    for name in ("start", "stop", "restart", "enable", "disable"):
+        p = sub.add_parser(name, help=f"{name} an engine" + (" at boot" if name in ("enable", "disable") else ""))
+        p.add_argument("engine", choices=["plexamp", "mpd"])
+    p = sub.add_parser("route", help="route a DAC (card id, number or MPD output name)")
+    p.add_argument("dac")
+    p.add_argument("target", choices=["mpd", "plexamp", "off"])
+    p = sub.add_parser("only", help="MPD plays to this DAC only")
+    p.add_argument("dac")
+    sub.add_parser("all", help="MPD plays to all its DACs (except Plexamp's)")
+    sub.add_parser("plexamp-sync", help=argparse.SUPPRESS)
+    args = ap.parse_args(argv)
+    cfg = load_config()
+    try:
+        if args.cmd is None:
+            tui(cfg)
+            return 0
+        if args.cmd == "status":
+            snap = snapshot(cfg)
+            if args.json:
+                print(json.dumps(status_dict(snap), indent=2))
+            else:
+                print_status(snap)
+            return 0
+        if args.cmd == "plexamp-sync":
+            plexamp_sync(cfg)
+            return 0         # never block Plexamp from starting
+        notes = {
+            "start": lambda: start(cfg, args.engine),
+            "stop": lambda: stop(cfg, args.engine),
+            "restart": lambda: restart(cfg, args.engine),
+            "enable": lambda: set_boot(cfg, args.engine, True),
+            "disable": lambda: set_boot(cfg, args.engine, False),
+            "route": lambda: route(cfg, args.dac, args.target),
+            "only": lambda: mpd_only(cfg, args.dac),
+            "all": lambda: mpd_all(cfg),
+        }[args.cmd]()
+        for n in notes:
+            print(n)
+        return 0
+    except Error as e:
+        print(f"audioctl: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

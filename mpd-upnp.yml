@@ -10,3 +10,6 @@
         # mpd_upnp_alsa_device: "hw:CARD=AUDIO"  # your DAC by id (/proc/asound/cards);
         #                                        # the default is dmix, NOT bit-perfect
         # mpd_upnp_friendly_name: "Hifi DAC" # name shown in Symfonium's cast menu
+        # mpd_upnp_alsa_outputs:              # several DACs at once (replaces
+        #   - { name: "Hifi DAC", device: "hw:CARD=AUDIO" }  # mpd_upnp_alsa_device)
+        #   - { name: "Mesh DAC", device: "hw:CARD=Card" }

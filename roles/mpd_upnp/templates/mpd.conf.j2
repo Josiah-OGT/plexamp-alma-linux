@@ -21,10 +21,11 @@ zeroconf_enabled "no"
 replaygain "off"
 volume_normalization "no"
 
+{% for output in mpd_upnp_alsa_outputs %}
 audio_output {
     type "alsa"
-    name "{{ mpd_upnp_friendly_name }}"
-    device "{{ mpd_upnp_alsa_device }}"
+    name "{{ output.name }}"
+    device "{{ output.device }}"
     mixer_type "{{ mpd_upnp_mixer_type }}"
     # The bit-perfect part: never resample/reformat to a fixed rate — open
     # the device at the source file's native rate/format/channels, exactly
@@ -33,3 +34,4 @@ audio_output {
     auto_format "no"
     auto_channels "no"
 }
+{% endfor %}

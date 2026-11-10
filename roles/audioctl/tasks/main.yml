@@ -1,0 +1,46 @@
+---
+- name: Install python3 (the tool is a single stdlib-only script, curses included)
+  ansible.builtin.dnf:
+    name: python3
+    state: present
+
+- name: Install audioctl
+  ansible.builtin.copy:
+    src: audioctl
+    dest: "{{ audioctl_bin }}"
+    mode: "0755"
+
+- name: Deploy audioctl config
+  ansible.builtin.template:
+    src: audioctl.json.j2
+    dest: /etc/audioctl.json
+    mode: "0644"
+
+# Holds which DAC is routed to Plexamp (by card id). Created empty-handed:
+# until a DAC is routed through audioctl, Plexamp's web-UI choice stands.
+- name: Create audioctl state directory
+  ansible.builtin.file:
+    path: /var/lib/audioctl
+    state: directory
+    mode: "0755"
+
+- name: Create Plexamp drop-in directory
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ audioctl_plexamp_service }}.service.d"
+    state: directory
+    mode: "0755"
+
+# Harmless on a box without Plexamp: a drop-in for a unit that doesn't
+# exist is simply never loaded.
+- name: Re-pin Plexamp's DAC before every start
+  ansible.builtin.template:
+    src: plexamp-audioctl.conf.j2
+    dest: "/etc/systemd/system/{{ audioctl_plexamp_service }}.service.d/audioctl.conf"
+    mode: "0644"
+  notify: reload systemd
+
+- name: Show usage
+  ansible.builtin.debug:
+    msg:
+      - "audioctl installed on {{ inventory_hostname }}: run `sudo audioctl` for the TUI,"
+      - "`audioctl status` for a quick look, `audioctl --help` for the scriptable CLI."

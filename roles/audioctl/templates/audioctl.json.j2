@@ -1,0 +1,9 @@
+{
+  "state_file": "/var/lib/audioctl/state.json",
+  "plexamp_unit": "{{ audioctl_plexamp_service }}.service",
+  "plexamp_settings_dir": "{{ audioctl_plexamp_home }}/.local/share/Plexamp/Settings",
+  "mpd_units": ["mpd.service", "upmpdcli.service"],
+  "mpd_conf": "{{ audioctl_mpd_base_dir }}/etc/mpd.conf",
+  "mpd_state_file": "{{ audioctl_mpd_base_dir }}/state/mpd/state",
+  "mpd_container": "mpd"
+}

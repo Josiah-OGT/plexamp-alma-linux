@@ -21,10 +21,12 @@ unmodified on an ARM target.
 ```
 plexamp.yml          # the playbook — edit plexamp_lan_cidr here before running
 mpd-upnp.yml          # optional second playbook: Navidrome/Symfonium endpoint (see below)
+audioctl.yml          # optional: TUI to start/stop engines and route DACs (see below)
 inventory.ini         # target host(s) — edit before running
 requirements.yml      # ansible.posix collection (needed for the firewalld module)
 roles/plexamp_headless/
 roles/mpd_upnp/
+roles/audioctl/
 ```
 
 ## Prerequisites
@@ -151,6 +153,25 @@ Two defaults you'll want to override in `mpd-upnp.yml` for real hardware:
   places would silently send playback to the wrong output.
 - `mpd_upnp_friendly_name` — the name Symfonium's cast menu shows.
 
+**More than one DAC:** set `mpd_upnp_alsa_outputs` instead of
+`mpd_upnp_alsa_device` and the one renderer plays out of all of them at
+once, each opened bit-perfect at the source rate:
+
+```yaml
+mpd_upnp_alsa_outputs:
+  - { name: "Hifi DAC", device: "hw:CARD=AUDIO" }
+  - { name: "Mesh DAC", device: "hw:CARD=Card" }
+```
+
+Each DAC runs on its own clock, so the outputs aren't sample-locked — fine
+for separate rooms or speakers + headphones, but expect a slight offset if
+both feed speakers in the same room. Turn one off without redeploying with
+`sudo podman exec mpd mpc disable 2` (`mpc outputs` lists them; the state
+survives restarts). A DAC that's unplugged just drops out — MPD keeps
+playing to the others. One plugged in *after* the `mpd` container started
+isn't visible to it (`AddDevice` copies `/dev/snd` nodes at start) until
+`sudo systemctl restart mpd upmpdcli`.
+
 In Symfonium, pick the **OpenHome** entry of the renderer (it appears twice):
 that keeps the queue on the box itself, with proper gapless, and playback
 survives the phone sleeping. Verify bit-perfect output the same way as
@@ -158,3 +179,57 @@ Plexamp: `hw_params` while two tracks of different sample rates play.
 Volume is intentionally not in the audio path (`mixer_type "none"`) — use
 your amp, or set `mpd_upnp_mixer_type: "hardware"` if your DAC has a real
 hardware mixer.
+
+## Managing it: `audioctl`
+
+`audioctl.yml` installs a small TUI (single stdlib-Python script, no extra
+packages) for the day-to-day: starting/stopping each engine, whether it
+starts at boot, and which DAC goes to which engine.
+
+```bash
+ansible-playbook audioctl.yml -i inventory.ini
+ssh mini-pc.local -t sudo audioctl
+```
+
+```
+── Engines ─────────────────────────────────────────────
+ ▶  Plexamp    ● running   boot: off  DAC: Card
+    MPD/UPnP   ● running   boot: on   DAC: AUDIO
+── DACs ────────────────────────────────────────────────
+    DAC     Routed to       Now                          Description
+    AUDIO   MPD             playing  44.1 kHz S32_LE  mpd   SUCA HIFI USB AUDIO
+    Card    Plexamp         closed                          Schiit Audio Mesh Card
+```
+
+Enter opens a menu for the selected row; `?` lists the hotkeys. Every
+action also exists as a command, for scripts or a quick change over SSH:
+
+| | |
+|---|---|
+| `audioctl status [--json]` | engines, routing, what each DAC is playing right now (rate/format) |
+| `audioctl start\|stop\|restart plexamp\|mpd` | run state |
+| `audioctl enable\|disable plexamp\|mpd` | start at boot |
+| `audioctl route <dac> mpd\|plexamp\|off` | `<dac>` = card id (`AUDIO`), number, or MPD output name |
+| `audioctl only <dac>` / `audioctl all` | MPD plays to one DAC / all of them |
+
+A DAC is routed to **one engine at a time**, because Plexamp holds its DAC
+open for as long as it runs. Routing a DAC to Plexamp takes it out of MPD's
+outputs (and vice versa — routing Plexamp's DAC to MPD stops Plexamp), so
+with two DACs **both engines can run at once**, one each. Plexamp drives a
+single DAC; MPD drives any number of the ones listed in
+`mpd_upnp_alsa_outputs` (a DAC that isn't there can't be routed to MPD
+until it's added and `mpd-upnp.yml` rerun).
+
+Details worth knowing:
+- **Plexamp's DAC is now owned by audioctl** once you route one to it. Plexamp
+  stores the device as a card *number*, which can change between boots, so
+  a drop-in re-pins it from the stable card id before every Plexamp start.
+  A device picked later in Plexamp's web UI gets overwritten on the next
+  start — use audioctl instead.
+- **MPD "disable at boot" masks the units.** Quadlet units are generated and
+  can't be `systemctl disable`d; audioctl masks them instead (and briefly
+  unmasks to start one that's boot-disabled). `mpd-upnp.yml` skips starting
+  masked units rather than undoing the choice.
+- **`plexamp.yml` re-enables and starts Plexamp** every run, as before. If
+  Plexamp is meant to be off, rerun `audioctl disable plexamp` / `stop
+  plexamp` afterwards.

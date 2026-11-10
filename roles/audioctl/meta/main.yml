@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  role_name: audioctl
+  description: >-
+    TUI/CLI to start, stop and boot-enable Plexamp and MPD/UPnP and route
+    each DAC to one of them
+  min_ansible_version: "2.15"
+  platforms:
+    - name: EL
+      versions:
+        - "10"

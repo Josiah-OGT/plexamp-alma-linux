@@ -1,0 +1,12 @@
+---
+# Where the TUI/CLI is installed. It manages systemd and runs podman, so it's
+# meant to be run with sudo — and EL's sudo secure_path is
+# /sbin:/bin:/usr/sbin:/usr/bin, so /usr/local/* would make `sudo audioctl`
+# "command not found".
+audioctl_bin: /usr/sbin/audioctl
+
+# These must match the plexamp_headless / mpd_upnp roles' settings. The
+# defaults below are those roles' defaults; override here if you changed them.
+audioctl_plexamp_home: /opt/plexamp
+audioctl_plexamp_service: plexamp
+audioctl_mpd_base_dir: /opt/mpd-upnp

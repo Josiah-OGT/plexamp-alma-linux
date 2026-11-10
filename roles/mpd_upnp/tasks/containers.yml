@@ -20,10 +20,24 @@
     daemon_reload: true
   when: mpd_upnp_quadlets is changed
 
-- name: Start the containers (enablement is static via the units' [Install])
-  ansible.builtin.systemd:
-    name: "{{ item }}"
-    state: started
+# Quadlet enablement is static via the units' [Install]; the only way to
+# keep one from starting at boot is masking it (what `audioctl disable mpd`
+# does). Leave a masked unit alone — starting it would fail the play, and
+# the mask is a deliberate choice this role shouldn't undo.
+- name: Check whether the containers are masked
+  ansible.builtin.command: systemctl is-enabled {{ item }}
   loop:
     - mpd.service
     - upmpdcli.service
+  register: mpd_upnp_unit_enabled
+  changed_when: false
+  failed_when: false
+
+- name: Start the containers
+  ansible.builtin.systemd:
+    name: "{{ item.item }}"
+    state: started
+  loop: "{{ mpd_upnp_unit_enabled.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.stdout != "masked"

@@ -1,0 +1,8 @@
+# Managed by Ansible (audioctl role).
+# Plexamp stores its DAC as hw:<card#>,<pcm#>, and card numbers are USB
+# enumeration order — they can swap between boots. Before each start,
+# rewrite the number from the DAC's stable id that audioctl remembers.
+# "+" runs it as root (the unit itself is User=plexamp); "-" means a
+# missing/broken audioctl can never stop Plexamp from starting.
+[Service]
+ExecStartPre=-+{{ audioctl_bin }} plexamp-sync

@@ -20,6 +20,20 @@ mpd_upnp_friendly_name: "Hifi DAC"
 # perfectly healthy.
 mpd_upnp_alsa_device: "default"
 
+# One MPD audio_output per entry; MPD plays to every enabled output at
+# once, each opened bit-perfect at the source's native rate. Defaults to
+# the single device above, so existing single-DAC deploys need no change.
+# For several DACs, override the whole list, e.g.:
+#   mpd_upnp_alsa_outputs:
+#     - { name: "Hifi DAC", device: "hw:CARD=AUDIO" }
+#     - { name: "Mesh DAC", device: "hw:CARD=Card" }
+# Outputs are fed from one shared stream but each DAC runs on its own
+# clock: fine for separate rooms/headphones, not sample-locked for two
+# speakers in the same room.
+mpd_upnp_alsa_outputs:
+  - name: "{{ mpd_upnp_friendly_name }}"
+    device: "{{ mpd_upnp_alsa_device }}"
+
 # "none" = no volume control in the audio path at all — bit-perfect, volume
 # is your amp's job (Symfonium's volume slider will do nothing).
 # "hardware" = use the DAC's own hardware mixer if it has one; still
