@@ -170,9 +170,9 @@ for separate rooms or speakers + headphones, but expect a slight offset if
 both feed speakers in the same room. Turn one off without redeploying with
 `sudo podman exec mpd mpc disable 2` (`mpc outputs` lists them; the state
 survives restarts). A DAC that's unplugged just drops out — MPD keeps
-playing to the others. One plugged in *after* the `mpd` container started
-isn't visible to it (`AddDevice` copies `/dev/snd` nodes at start) until
-`sudo systemctl restart mpd upmpdcli`.
+playing to the others. For a DAC that isn't in the list (say one you plug
+in later), `sudo audioctl route <DAC> mpd` adds an output without a
+redeploy — see the audioctl section.
 
 In Symfonium, pick the **OpenHome** entry of the renderer (it appears twice):
 that keeps the queue on the box itself, with proper gapless, and playback
@@ -247,15 +247,31 @@ action also exists as a command, for scripts or a quick change over SSH:
 | `audioctl route <dac> mpd\|plexamp\|caldera\|off` | `<dac>` = card id (`AUDIO`), number, or MPD output name |
 | `audioctl caldera-login [--player-name N]` | Caldera's one-time Plex login |
 | `audioctl only <dac>` / `audioctl all` | MPD plays to one DAC / all of them |
+| `audioctl mpd-forget <dac>` | remove an MPD output audioctl added (works with the DAC unplugged) |
 
 A DAC is routed to **one engine at a time**, because an engine with a DAC
 open makes it busy for the others (Plexamp holds its DAC for as long as it
 runs). Routing a DAC to one engine takes it from whichever had it — out of
 MPD's outputs, or stopping Plexamp/Caldera if they were on it — so the
 engines can all run at once, each on its own DAC. Plexamp and Caldera each
-drive a single DAC; MPD drives any number of the ones listed in
-`mpd_upnp_alsa_outputs` (a DAC that isn't there can't be routed to MPD
-until it's added and `mpd-upnp.yml` rerun).
+drive a single DAC; MPD drives any number.
+
+**Plugging in another DAC.** It shows up in audioctl as soon as the kernel
+sees it, by its card id, and can be routed to Plexamp or Caldera straight
+away. Routing it to MPD the first time adds an MPD output for it, because
+MPD only knows the DACs in `mpd_upnp_alsa_outputs`:
+- audioctl keeps those extra outputs in `/var/lib/audioctl/state.json` and
+  writes them to `/opt/mpd-upnp/etc/mpd.d/audioctl-outputs.conf`, which
+  `mpd.conf` includes. A drop-in rewrites the file before every MPD start.
+- MPD can't add an output while running, and the container only sees DACs
+  that existed when it started, so **adding one restarts MPD**. Whatever
+  MPD is playing on its other DACs stops, and may need play pressing again
+  (a stream from the phone often can't be resumed).
+- The output is named after the DAC's description, and `audioctl all`
+  includes it from then on. `sudo audioctl mpd-forget <DAC>` removes it
+  (also a restart); `audioctl status` points at it if the DAC is unplugged.
+- Adding the same DAC to `mpd_upnp_alsa_outputs` later is fine: at the next
+  MPD start audioctl drops its own output for it, so it never gets two.
 
 Details worth knowing:
 - **Plexamp's DAC is now owned by audioctl** once you route one to it. Plexamp

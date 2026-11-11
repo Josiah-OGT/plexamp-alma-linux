@@ -31,6 +31,7 @@ DEFAULTS = {
     "plexamp_settings_dir": "/opt/plexamp/.local/share/Plexamp/Settings",
     "mpd_units": ["mpd.service", "upmpdcli.service"],
     "mpd_conf": "/opt/mpd-upnp/etc/mpd.conf",
+    "mpd_extra_conf": "/opt/mpd-upnp/etc/mpd.d/audioctl-outputs.conf",
     "mpd_state_file": "/opt/mpd-upnp/state/mpd/state",
     "mpd_container": "mpd",
     "caldera_user": "caldera",
@@ -293,17 +294,31 @@ class Output:
     name: str
     device: str
     enabled: bool = True
+    added: bool = False     # added by audioctl (mpd.d include), not by the Ansible role
+
+
+def _output_blocks(text):
+    """key -> value of every audio_output block, in config order."""
+    return [dict(re.findall(r'^\s*(\w+)\s+"([^"]*)"', b.group(1), re.M))
+            for b in re.finditer(r"audio_output\s*\{(.*?)\n\s*\}", text, re.S)]
+
+
+def mpd_has_include(cfg):
+    """Is mpd.conf new enough to load the outputs audioctl adds?"""
+    name = re.escape(os.path.basename(cfg["mpd_extra_conf"]))
+    return bool(re.search(rf'^\s*include(?:_optional)?\s+"[^"]*{name}"', _read(cfg["mpd_conf"]), re.M))
 
 
 def read_mpd_outputs(cfg, mpd_running):
-    text = _read(cfg["mpd_conf"])
+    blocks = [(kv, False) for kv in _output_blocks(_read(cfg["mpd_conf"]))]
+    if mpd_has_include(cfg):    # the include line comes after the role's outputs
+        blocks += [(kv, True) for kv in _output_blocks(_read(cfg["mpd_extra_conf"]))]
     outs = []
-    for i, block in enumerate(re.finditer(r"audio_output\s*\{(.*?)\n\s*\}", text, re.S), 1):
-        kv = dict(re.findall(r'^\s*(\w+)\s+"([^"]*)"', block.group(1), re.M))
+    for i, (kv, added) in enumerate(blocks, 1):
         if kv.get("type") != "alsa":
             continue
         outs.append(Output(i, kv.get("name", f"output {i}"), kv.get("device", "default"),
-                           kv.get("enabled", "yes") != "no"))
+                           kv.get("enabled", "yes") != "no", added))
     states = None
     if mpd_running:
         p = run(["podman", "exec", cfg["mpd_container"], "mpc", "outputs"], check=False)
@@ -356,6 +371,126 @@ def mpd_set_output(cfg, snap, out, on):
         os.chmod(tmp, st.st_mode & 0o7777)
         os.replace(tmp, path)
     out.enabled = on
+
+
+# --------------------------------------------------------------------------
+# MPD outputs for DACs plugged in later
+#
+# The role writes one audio_output per DAC in mpd_upnp_alsa_outputs. For any
+# other DAC, `route <DAC> mpd` adds an output here instead: audioctl's state
+# file lists them, and mpd.conf includes the file generated from that list
+# (regenerated before every MPD start by an ExecStartPre drop-in). MPD can't
+# add outputs at runtime, so adding/forgetting one restarts it.
+# --------------------------------------------------------------------------
+
+def _clean(text):
+    return re.sub(r'["\\\n]', "", text).strip()
+
+
+def mpd_sync(cfg, quiet=False):
+    """Regenerate the include from the state file. Drops DACs the Ansible
+    list has since gained, so a DAC never gets two outputs."""
+    path = cfg["mpd_extra_conf"]
+    if not os.path.isdir(os.path.dirname(path)):
+        return []           # mpd_upnp role predates this; nothing to write into
+    static = _output_blocks(_read(cfg["mpd_conf"]))
+    static_refs = {device_card_ref(kv.get("device")) for kv in static}
+    mixer = next((kv["mixer_type"] for kv in static if "mixer_type" in kv), "none")
+    state = load_state(cfg)
+    extra, notes = [], []
+    for o in state.get("mpd_extra", []):
+        if o["card"] in static_refs:
+            notes.append(f"{o['card']} is in mpd_upnp_alsa_outputs now - dropped audioctl's "
+                         f"output '{o['name']}' for it")
+        else:
+            extra.append(o)
+    if notes:
+        state["mpd_extra"] = extra
+        save_state(cfg, state)
+    text = ("# Managed by audioctl - do not edit. DACs added with `audioctl route <DAC> mpd`;\n"
+            "# remove one with `audioctl mpd-forget <DAC>`. Rewritten from\n"
+            f"# {cfg['state_file']} before every MPD start.\n")
+    for o in extra:
+        text += (f'\naudio_output {{\n    type "alsa"\n    name "{o["name"]}"\n'
+                 f'    device "{o["device"]}"\n    mixer_type "{mixer}"\n'
+                 '    auto_resample "no"\n    auto_format "no"\n    auto_channels "no"\n}\n')
+    if _read(path) != text:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    if not quiet:
+        for n in notes:
+            print(f"audioctl: {n}", file=sys.stderr)
+    return notes
+
+
+def _restart_mpd(cfg, eng, expect=None, gone=None):
+    """Restart just mpd.service (upmpdcli Requires= it, so it follows), then
+    wait for MPD to answer with the new output list."""
+    masked = eng.masked_units
+    if masked:
+        sctl(eng, "unmask", *masked)
+    try:
+        sctl(eng, "restart", eng.units[0])
+    finally:
+        if masked:
+            sctl(eng, "mask", *masked)
+    names = re.findall(r"^Output \d+ \((.*)\) is", mpc(cfg, "outputs").stdout, re.M)
+    if (expect and expect not in names) or (gone and gone in names):
+        raise Error(f"MPD restarted but its outputs are {names} - see journalctl -u mpd")
+
+
+def mpd_add_output(cfg, snap, card, notes):
+    eng = snap.engines["mpd"]
+    if not mpd_has_include(cfg) or not os.path.isdir(os.path.dirname(cfg["mpd_extra_conf"])):
+        raise Error(f"MPD has no output for {card.id}, and its config predates audioctl "
+                    "adding DACs - redeploy mpd-upnp.yml once, then retry")
+    if not card.pcms:
+        raise Error(f"{card.id} has no playback device")
+    taken = {o.name.lower() for o in snap.outputs}
+    name = _clean(card.desc) or card.id
+    if name.lower() in taken:
+        name = f"{name} ({card.id})"
+    state = load_state(cfg)
+    state.setdefault("mpd_extra", []).append(
+        {"card": card.id, "name": name, "device": f"hw:CARD={card.id},DEV={card.pcms[0]}"})
+    save_state(cfg, state)
+    mpd_sync(cfg, quiet=True)
+    if eng.running:
+        _restart_mpd(cfg, eng, expect=name)
+        notes.append(f"MPD output '{name}' added (MPD restarted)")
+    else:
+        notes.append(f"MPD output '{name}' added")
+    fresh = snapshot(cfg)
+    out = fresh.output_for(find_card(fresh.cards, card.id))
+    if out and not out.enabled:   # a stale per-name "disabled" in MPD's state file
+        mpd_set_output(cfg, fresh, out, True)
+    return out
+
+
+def mpd_forget(cfg, ref):
+    """Remove an output audioctl added (the DAC may already be unplugged)."""
+    require_root()
+    state = load_state(cfg)
+    extra = state.get("mpd_extra", [])
+    hit = next((o for o in extra if ref.lower() in (o["card"].lower(), o["name"].lower())), None)
+    if not hit:
+        snap = snapshot(cfg)
+        if any(ref.lower() in (o.name.lower(), (device_card_ref(o.device) or "").lower())
+               for o in snap.outputs if not o.added):
+            raise Error(f"{ref}'s MPD output comes from mpd_upnp_alsa_outputs - "
+                        "remove it there and redeploy mpd-upnp.yml")
+        raise Error(f"audioctl hasn't added an MPD output for '{ref}'")
+    state["mpd_extra"] = [o for o in extra if o is not hit]
+    save_state(cfg, state)
+    mpd_sync(cfg, quiet=True)
+    eng = snapshot(cfg).engines["mpd"]
+    if eng.running:
+        _restart_mpd(cfg, eng, gone=hit["name"])
+        return [f"MPD output '{hit['name']}' removed (MPD restarted)"]
+    return [f"MPD output '{hit['name']}' removed"]
 
 
 # --------------------------------------------------------------------------
@@ -658,11 +793,13 @@ def route(cfg, ref, target):
     elif target == "mpd":
         if not snap.engines["mpd"].installed:
             raise Error("MPD/UPnP is not installed")
-        if not out:
-            raise Error(f"MPD has no output for {card.id} - add "
-                        f'{{ name: ..., device: "hw:CARD={card.id}" }} to '
-                        "mpd_upnp_alsa_outputs and redeploy mpd-upnp.yml")
+        if not out and not card.pcms:
+            raise Error(f"{card.id} has no playback device")
         _release(cfg, snap, card, "mpd", notes)
+        if not out:
+            out = mpd_add_output(cfg, snap, card, notes)
+            notes.append(f"{card.id} -> MPD ({out.name if out else '?'})")
+            return notes
         if not out.enabled:
             mpd_set_output(cfg, snap, out, True)
         notes.append(f"{card.id} -> MPD ({out.name})")
@@ -770,6 +907,7 @@ def status_dict(snap):
                     for k, e in snap.engines.items() if e.installed},
         "dacs": [{"id": c.id, "card": c.index, "desc": c.desc, "routes": snap.routes(c),
                   "mpd_output": (snap.output_for(c).name if snap.output_for(c) else None),
+                  "mpd_output_added": bool(snap.output_for(c) and snap.output_for(c).added),
                   "state": c.state, "rate": c.rate, "format": c.fmt, "owner": c.owner}
                  for c in snap.cards],
     }
@@ -789,6 +927,11 @@ def print_status(snap):
     for k in SINGLE:
         if snap.dangling(k):
             print(f"\n{snap.engines[k].label}'s DAC '{snap.single[k]}' is not connected.")
+    for o in snap.outputs:
+        if not find_card(snap.cards, device_card_ref(o.device)):
+            fix = (f"sudo audioctl mpd-forget {device_card_ref(o.device)}" if o.added
+                   else "it's in mpd_upnp_alsa_outputs")
+            print(f"\nMPD output '{o.name}' ({o.device}): DAC not connected ({fix}).")
 
 
 # --------------------------------------------------------------------------
@@ -807,7 +950,9 @@ HELP = """\
    b   toggle start-at-boot
 
  On a DAC row:
-   m   route to MPD (added to whatever MPD already plays to)
+   m   route to MPD (added to whatever MPD already plays to). A DAC MPD
+       has no output for yet gets one; that restarts MPD, which stops
+       what it's playing. `audioctl mpd-forget <DAC>` removes it again.
    1   MPD plays to this DAC only
    a   MPD plays to all its DACs (except ones Plexamp/Caldera are using)
    p   route to Plexamp   (drives exactly one DAC)
@@ -1074,7 +1219,10 @@ def main(argv=None):
     sub.add_parser("all", help="MPD plays to all its DACs (except Plexamp's/Caldera's)")
     p = sub.add_parser("caldera-login", help="log Caldera in to Plex (interactive plex.tv/link PIN)")
     p.add_argument("--player-name", help="name shown in Plex's cast menu")
+    p = sub.add_parser("mpd-forget", help="remove an MPD output audioctl added for a DAC")
+    p.add_argument("dac", help="card id or output name (the DAC may be unplugged)")
     sub.add_parser("plexamp-sync", help=argparse.SUPPRESS)
+    sub.add_parser("mpd-sync", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     cfg = load_config()
     try:
@@ -1091,6 +1239,12 @@ def main(argv=None):
         if args.cmd == "plexamp-sync":
             plexamp_sync(cfg)
             return 0         # never block Plexamp from starting
+        if args.cmd == "mpd-sync":
+            try:
+                mpd_sync(cfg)
+            except OSError as e:
+                print(f"audioctl: mpd-sync: {e}", file=sys.stderr)
+            return 0         # never block MPD from starting
         notes = {
             "start": lambda: start(cfg, args.engine),
             "stop": lambda: stop(cfg, args.engine),
@@ -1101,6 +1255,7 @@ def main(argv=None):
             "only": lambda: mpd_only(cfg, args.dac),
             "all": lambda: mpd_all(cfg),
             "caldera-login": lambda: caldera_login(cfg, args.player_name),
+            "mpd-forget": lambda: mpd_forget(cfg, args.dac),
         }[args.cmd]()
         for n in notes:
             print(n)

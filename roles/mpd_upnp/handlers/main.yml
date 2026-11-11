@@ -1,12 +1,21 @@
 ---
+# Masked = boot-disabled with audioctl; systemd refuses to (re)start a
+# masked unit, and this role shouldn't undo the mask. If it's running
+# anyway, `sudo audioctl restart mpd` picks up the new config.
 - name: restart mpd
   ansible.builtin.systemd:
     name: mpd.service
     state: restarted
     daemon_reload: true
+  when: >-
+    (mpd_upnp_unit_enabled.results | selectattr('item', 'eq', 'mpd.service')
+     | map(attribute='stdout') | first | default('')) != 'masked'
 
 - name: restart upmpdcli
   ansible.builtin.systemd:
     name: upmpdcli.service
     state: restarted
     daemon_reload: true
+  when: >-
+    (mpd_upnp_unit_enabled.results | selectattr('item', 'eq', 'upmpdcli.service')
+     | map(attribute='stdout') | first | default('')) != 'masked'

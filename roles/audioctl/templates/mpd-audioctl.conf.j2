@@ -1,0 +1,6 @@
+# Managed by Ansible (audioctl role).
+# Regenerate the MPD outputs audioctl added for DACs that aren't in
+# mpd_upnp_alsa_outputs (mpd.conf includes the file) before every start.
+# "-" means a missing/broken audioctl can never stop MPD from starting.
+[Service]
+ExecStartPre=-{{ audioctl_bin }} mpd-sync
