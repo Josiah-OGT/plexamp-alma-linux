@@ -1,0 +1,14 @@
+---
+galaxy_info:
+  role_name: caldera_music
+  description: >-
+    Caldera Music headless Plex player as a lingering user service of its own
+    account, with bit-perfect preferences, on RHEL-family hosts
+  min_ansible_version: "2.15"
+  platforms:
+    - name: EL
+      versions:
+        - "10"
+
+collections:
+  - ansible.posix

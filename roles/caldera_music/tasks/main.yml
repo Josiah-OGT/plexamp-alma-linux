@@ -1,0 +1,264 @@
+---
+- name: Fail fast if LAN CIDR was not set
+  ansible.builtin.assert:
+    that:
+      - caldera_music_lan_cidr != "CHANGE_ME/24"
+      - caldera_music_lan_cidr is match('^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$')
+    fail_msg: >-
+      caldera_music_lan_cidr must be set to your actual IPv4 LAN subnet in CIDR
+      form (e.g. 192.168.1.0/24) — refusing to open ports with no scope.
+      Current value: {{ caldera_music_lan_cidr }}
+
+- name: Install archive, firewall and audio tooling
+  ansible.builtin.dnf:
+    name:
+      - tar
+      - gzip
+      - alsa-utils
+      - firewalld
+      - python3-libselinux
+    state: present
+
+- name: Ensure firewalld is running
+  ansible.builtin.systemd:
+    name: firewalld
+    enabled: true
+    state: started
+
+# --- account + its user manager -------------------------------------------
+
+- name: Create caldera group
+  ansible.builtin.group:
+    name: "{{ caldera_music_user }}"
+    system: true
+
+- name: Create caldera system user
+  ansible.builtin.user:
+    name: "{{ caldera_music_user }}"
+    group: "{{ caldera_music_user }}"
+    groups: audio
+    append: true
+    system: true
+    home: "{{ caldera_music_home }}"
+    create_home: true
+    shell: /sbin/nologin
+
+- name: Look up the caldera account's uid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ caldera_music_user }}"
+
+- name: Set Caldera paths
+  ansible.builtin.set_fact:
+    caldera_music_uid: "{{ ansible_facts.getent_passwd[caldera_music_user][1] }}"
+    caldera_music_dir: "{{ caldera_music_home }}/caldera-music"
+    caldera_music_cfg: "{{ caldera_music_home }}/.config/caldera-music"
+    caldera_music_unit_dir: "{{ caldera_music_home }}/.config/systemd/user"
+    # The binary is always run as the account itself (never root), so every
+    # file it writes stays owned by caldera.
+    caldera_music_run: >-
+      runuser -u {{ caldera_music_user }} -- env HOME={{ caldera_music_home }}
+      LD_LIBRARY_PATH={{ caldera_music_home }}/caldera-music/lib
+      {{ caldera_music_home }}/caldera-music/bin/caldera-music
+      --config {{ caldera_music_home }}/.config/caldera-music
+    caldera_music_sctl: "systemctl --user -M {{ caldera_music_user }}@"
+    caldera_music_release_url: >-
+      {{ caldera_music_release_base }}/{{ 'beta/' if caldera_music_channel == 'beta' else '' }}latest
+
+# Without lingering the account's user manager only exists while it's
+# logged in — which a nologin account never is — so the unit could neither
+# run nor start at boot.
+- name: Enable lingering for the caldera account
+  ansible.builtin.command: loginctl enable-linger {{ caldera_music_user }}
+  args:
+    creates: "/var/lib/systemd/linger/{{ caldera_music_user }}"
+
+- name: Wait for the caldera user manager
+  ansible.builtin.command: systemctl is-active user@{{ caldera_music_uid }}.service
+  register: caldera_music_manager
+  until: caldera_music_manager.rc == 0
+  retries: 15
+  delay: 1
+  changed_when: false
+
+# --- install (first run only; Caldera self-updates after that) -------------
+
+- name: Check for an existing install
+  ansible.builtin.stat:
+    path: "{{ caldera_music_dir }}/VERSION"
+  register: caldera_music_version_file
+
+- name: Install Caldera Music
+  when: not caldera_music_version_file.stat.exists
+  block:
+    - name: Resolve the latest release on the configured channel
+      ansible.builtin.uri:
+        url: "{{ caldera_music_release_url }}/latest.json"
+        return_content: true
+      register: caldera_music_latest
+
+    - name: Create install directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ caldera_music_user }}"
+        group: "{{ caldera_music_user }}"
+        mode: "0755"
+      loop:
+        - "{{ caldera_music_dir }}"
+        - "{{ caldera_music_cfg }}"
+
+    - name: Download and unpack Caldera Music {{ (caldera_music_latest.content | from_json).version }}
+      ansible.builtin.unarchive:
+        src: "{{ caldera_music_release_url }}/caldera-music-linux-{{ ansible_facts.architecture }}.tar.gz"
+        dest: "{{ caldera_music_dir }}"
+        remote_src: true
+        owner: "{{ caldera_music_user }}"
+        group: "{{ caldera_music_user }}"
+
+    - name: Record the update channel (what install.sh does)
+      ansible.builtin.command: "{{ caldera_music_run }} --set update.channel={{ caldera_music_channel }}"
+      changed_when: true
+
+- name: Create the account's systemd user unit directory
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ caldera_music_user }}"
+    group: "{{ caldera_music_user }}"
+    mode: "0755"
+  loop:
+    - "{{ caldera_music_home }}/.config"
+    - "{{ caldera_music_home }}/.config/systemd"
+    - "{{ caldera_music_unit_dir }}"
+
+# The release ships its own unit (upgrade.sh refreshes it the same way).
+- name: Install the user unit shipped with the release
+  ansible.builtin.copy:
+    src: "{{ caldera_music_dir }}/caldera-music.service"
+    dest: "{{ caldera_music_unit_dir }}/caldera-music.service"
+    remote_src: true
+    owner: "{{ caldera_music_user }}"
+    group: "{{ caldera_music_user }}"
+    mode: "0644"
+  register: caldera_music_unit
+
+- name: Reload the caldera user manager
+  ansible.builtin.command: "{{ caldera_music_sctl }} daemon-reload"
+  when: caldera_music_unit is changed
+  changed_when: true
+
+# --- preferences ------------------------------------------------------------
+
+- name: Build desired preferences
+  ansible.builtin.set_fact:
+    caldera_music_desired: >-
+      {{ caldera_music_bitperfect_prefs
+         | combine({'companion.port': caldera_music_companion_port})
+         | combine({'companion.clientName': caldera_music_player_name}
+                   if caldera_music_player_name | length > 0 else {})
+         | combine(caldera_music_extra_prefs) }}
+
+- name: Read current preferences
+  ansible.builtin.command: "{{ caldera_music_run }} --get {{ item.key }}"
+  loop: "{{ caldera_music_desired | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: caldera_music_current
+  changed_when: false
+
+- name: Collect preferences to change
+  ansible.builtin.set_fact:
+    caldera_music_to_set: >-
+      {{ caldera_music_to_set | default([])
+         + ([item.item.key ~ '=' ~ item.item.value]
+            if (item.stdout | trim | lower) != (item.item.value | string | lower) else []) }}
+  loop: "{{ caldera_music_current.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+# Caldera writes preferences.json on shutdown, so setting while it runs would
+# be overwritten: stop it, set, and bring it back only if it was running.
+- name: Apply changed preferences
+  when: caldera_music_to_set | default([]) | length > 0
+  block:
+    - name: Check whether Caldera is running
+      ansible.builtin.command: "{{ caldera_music_sctl }} is-active caldera-music.service"
+      register: caldera_music_active
+      changed_when: false
+      failed_when: false
+
+    - name: Stop Caldera while preferences change
+      ansible.builtin.command: "{{ caldera_music_sctl }} stop caldera-music.service"
+      when: caldera_music_active.stdout == "active"
+      changed_when: true
+
+    - name: Set preferences
+      ansible.builtin.command: >-
+        {{ caldera_music_run }}
+        {% for kv in caldera_music_to_set %} --set {{ kv | quote }}{% endfor %}
+      changed_when: true
+
+    - name: Start Caldera again
+      ansible.builtin.command: "{{ caldera_music_sctl }} start caldera-music.service"
+      when: caldera_music_active.stdout == "active"
+      changed_when: true
+
+# --- firewall ---------------------------------------------------------------
+# Same LAN-scoped rich rules + stale-CIDR cleanup as the other roles.
+
+- name: Check previously applied LAN CIDR
+  ansible.builtin.slurp:
+    src: /etc/caldera-music-lan-cidr
+  register: caldera_music_prev_cidr_raw
+  failed_when: false
+
+- name: Remove rich rules for a previous LAN CIDR
+  when:
+    - caldera_music_prev_cidr_raw.content is defined
+    - (caldera_music_prev_cidr_raw.content | b64decode | trim) != caldera_music_lan_cidr
+  ansible.posix.firewalld:
+    rich_rule: >-
+      rule family="ipv4"
+      source address="{{ caldera_music_prev_cidr_raw.content | b64decode | trim }}"
+      port port="{{ item.port }}" protocol="{{ item.proto }}"
+      accept
+    permanent: true
+    immediate: true
+    state: disabled
+  loop: "{{ caldera_music_firewall_ports }}"
+  loop_control:
+    label: "{{ item.port }}/{{ item.proto }}"
+
+- name: Allow Plex Companion and discovery from LAN only
+  ansible.posix.firewalld:
+    rich_rule: >-
+      rule family="ipv4"
+      source address="{{ caldera_music_lan_cidr }}"
+      port port="{{ item.port }}" protocol="{{ item.proto }}"
+      accept
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ caldera_music_firewall_ports }}"
+  loop_control:
+    label: "{{ item.port }}/{{ item.proto }}"
+
+- name: Record applied LAN CIDR
+  ansible.builtin.copy:
+    content: "{{ caldera_music_lan_cidr }}"
+    dest: /etc/caldera-music-lan-cidr
+    mode: "0644"
+
+# --- next steps -------------------------------------------------------------
+# The role never starts, stops or boot-enables Caldera: which DAC it gets and
+# whether it runs is audioctl's job, and rerunning this play shouldn't undo it.
+- name: Show next steps
+  ansible.builtin.debug:
+    msg:
+      - "Caldera Music is installed for the {{ caldera_music_user }} account on {{ inventory_hostname }}."
+      - "It isn't started: it needs a Plex login and a DAC first (needs the audioctl role):"
+      - "  1. sudo audioctl caldera-login --player-name 'Den'   (plex.tv/link PIN, interactive)"
+      - "  2. sudo audioctl route <DAC> caldera                  (audioctl status lists DACs)"
+      - "  3. sudo audioctl start caldera; sudo audioctl enable caldera  (to start at boot)"
+      - "Then cast to it from Plex/Plexamp on your phone. Companion port: {{ caldera_music_companion_port }}."

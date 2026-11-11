@@ -21,11 +21,13 @@ unmodified on an ARM target.
 ```
 plexamp.yml          # the playbook — edit plexamp_lan_cidr here before running
 mpd-upnp.yml          # optional second playbook: Navidrome/Symfonium endpoint (see below)
+caldera-music.yml     # optional: Caldera Music, a second Plex player (see below)
 audioctl.yml          # optional: TUI to start/stop engines and route DACs (see below)
 inventory.ini         # target host(s) — edit before running
 requirements.yml      # ansible.posix collection (needed for the firewalld module)
 roles/plexamp_headless/
 roles/mpd_upnp/
+roles/caldera_music/
 roles/audioctl/
 ```
 
@@ -180,11 +182,44 @@ Volume is intentionally not in the audio path (`mixer_type "none"`) — use
 your amp, or set `mpd_upnp_mixer_type: "hardware"` if your DAC has a real
 hardware mixer.
 
+## Third role: `caldera_music` — another Plex player
+
+Caldera Music is a headless Plex player you cast to
+from Plex/Plexamp on your phone, like headless Plexamp. `caldera-music.yml`
+installs it for a dedicated `caldera` account and runs it the way its own
+installer intends — as that account's systemd *user* unit, so Caldera's
+built-in self-updater keeps working — with lingering on so it runs without
+anyone logged in.
+
+```bash
+# set caldera_music_lan_cidr in caldera-music.yml first, same rules as the others
+ansible-playbook caldera-music.yml -i inventory.ini
+```
+
+The role only installs on the first run; after that Caldera updates itself
+(`caldera_music_channel: stable` or `beta`). On every run it enforces:
+- **Bit-perfect preferences.** Caldera's defaults resample everything to
+  44.1 kHz, attenuate with software volume at 20%, and apply loudness
+  leveling and crossfades. The role sets source-rate output, volume 100 and
+  turns leveling and sweet fades off (`caldera_music_bitperfect_prefs`).
+- **Companion port 32501, not 32500.** Caldera defaults to the same port as
+  headless Plexamp; on one box they couldn't both run.
+
+It never starts, stops or boot-enables Caldera — that's audioctl's job (it
+won't let an engine start, or start at boot, without a DAC routed to it):
+
+```bash
+sudo audioctl caldera-login --player-name "Den"   # plex.tv/link PIN, one-time
+sudo audioctl route Card caldera
+sudo audioctl start caldera && sudo audioctl enable caldera
+```
+
 ## Managing it: `audioctl`
 
 `audioctl.yml` installs a small TUI (single stdlib-Python script, no extra
-packages) for the day-to-day: starting/stopping each engine, whether it
-starts at boot, and which DAC goes to which engine.
+packages) for the day-to-day: starting/stopping each engine (Plexamp,
+Caldera, MPD/UPnP — whichever are installed), whether it starts at boot,
+and which DAC goes to which engine.
 
 ```bash
 ansible-playbook audioctl.yml -i inventory.ini
@@ -207,16 +242,18 @@ action also exists as a command, for scripts or a quick change over SSH:
 | | |
 |---|---|
 | `audioctl status [--json]` | engines, routing, what each DAC is playing right now (rate/format) |
-| `audioctl start\|stop\|restart plexamp\|mpd` | run state |
-| `audioctl enable\|disable plexamp\|mpd` | start at boot |
-| `audioctl route <dac> mpd\|plexamp\|off` | `<dac>` = card id (`AUDIO`), number, or MPD output name |
+| `audioctl start\|stop\|restart plexamp\|caldera\|mpd` | run state |
+| `audioctl enable\|disable plexamp\|caldera\|mpd` | start at boot |
+| `audioctl route <dac> mpd\|plexamp\|caldera\|off` | `<dac>` = card id (`AUDIO`), number, or MPD output name |
+| `audioctl caldera-login [--player-name N]` | Caldera's one-time Plex login |
 | `audioctl only <dac>` / `audioctl all` | MPD plays to one DAC / all of them |
 
-A DAC is routed to **one engine at a time**, because Plexamp holds its DAC
-open for as long as it runs. Routing a DAC to Plexamp takes it out of MPD's
-outputs (and vice versa — routing Plexamp's DAC to MPD stops Plexamp), so
-with two DACs **both engines can run at once**, one each. Plexamp drives a
-single DAC; MPD drives any number of the ones listed in
+A DAC is routed to **one engine at a time**, because an engine with a DAC
+open makes it busy for the others (Plexamp holds its DAC for as long as it
+runs). Routing a DAC to one engine takes it from whichever had it — out of
+MPD's outputs, or stopping Plexamp/Caldera if they were on it — so the
+engines can all run at once, each on its own DAC. Plexamp and Caldera each
+drive a single DAC; MPD drives any number of the ones listed in
 `mpd_upnp_alsa_outputs` (a DAC that isn't there can't be routed to MPD
 until it's added and `mpd-upnp.yml` rerun).
 

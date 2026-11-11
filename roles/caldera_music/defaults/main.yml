@@ -1,0 +1,41 @@
+---
+# Dedicated account; Caldera runs as a systemd *user* unit of it (the layout
+# its own install.sh/upgrade.sh assume — the built-in self-updater calls
+# `systemctl --user`). Lingering keeps that user manager up without a login.
+caldera_music_user: caldera
+caldera_music_home: /var/lib/caldera
+
+caldera_music_release_base: https://releases.caldera.homes/music/headless
+# "stable" or "beta". Only the first install is done by this role — after
+# that Caldera updates itself on this channel.
+caldera_music_channel: stable
+
+# LAN CIDR allowed to reach the Companion port and Plex discovery.
+# MUST be overridden per environment — there is no safe default.
+caldera_music_lan_cidr: "CHANGE_ME/24"
+
+# Plex Companion HTTP port. Caldera's own default is 32500 — the port
+# headless Plexamp uses — so on a box that has both, whichever started
+# second couldn't bind it. 32501 lets them run side by side.
+caldera_music_companion_port: 32501
+
+# Name in Plex's cast menu. Empty = Caldera's default, "Caldera Music (<hostname>)".
+caldera_music_player_name: ""
+
+# Caldera's out-of-the-box defaults are not bit-perfect: it resamples
+# everything to 44.1 kHz, attenuates with software volume at 20%, and
+# applies loudness leveling and crossfades. These undo all of that.
+caldera_music_bitperfect_prefs:
+  audio.sampleRate: 0          # 0 = open the DAC at the source's rate
+  audio.channels: 0            # 0 = source's channel count
+  audio.masterVolume: 100      # no software attenuation; volume is the amp's job
+  player.loudnessLeveling: "no"
+  player.sweetFades: "no"
+
+# Anything else to set, by dot-path (`caldera-music --prefs` lists them all).
+caldera_music_extra_prefs: {}
+
+# Ports opened for caldera_music_lan_cidr.
+caldera_music_firewall_ports:
+  - { port: "{{ caldera_music_companion_port }}", proto: "tcp" }  # Plex Companion (cast/control)
+  - { port: "32410-32414", proto: "udp" }                          # Plex GDM discovery
