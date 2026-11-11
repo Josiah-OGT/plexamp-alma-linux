@@ -1,14 +1,14 @@
 #!/usr/bin/python3
 """audioctl - start/stop the audio engines and route DACs between them.
 
-Two engines can drive the box's DACs:
-  Plexamp   plexamp.service           one DAC, held open the whole time it runs
-  MPD/UPnP  mpd + upmpdcli quadlets   any number of DACs (one MPD audio_output each)
+Three engines can drive the box's DACs:
+  Plexamp   plexamp.service              one DAC, held open the whole time it runs
+  Caldera   caldera-music.service        one DAC (a user unit of the caldera account)
+  MPD/UPnP  mpd + upmpdcli quadlets      any number of DACs (one MPD audio_output each)
 
-A DAC is routed to at most one of them: Plexamp opens its DAC exclusively
-at start, so a DAC MPD also plays to fails with "Device or resource busy".
-audioctl keeps the routing exclusive, so both engines can run at once on
-different DACs.
+A DAC is routed to at most one of them: an engine that has a DAC open makes
+it "Device or resource busy" for the others. audioctl keeps the routing
+exclusive, so all of them can run at once on different DACs.
 
 Run with no arguments for the TUI. `audioctl --help` lists the CLI.
 """
@@ -31,12 +31,20 @@ DEFAULTS = {
     "plexamp_settings_dir": "/opt/plexamp/.local/share/Plexamp/Settings",
     "mpd_units": ["mpd.service", "upmpdcli.service"],
     "mpd_conf": "/opt/mpd-upnp/etc/mpd.conf",
+    "mpd_extra_conf": "/opt/mpd-upnp/etc/mpd.d/audioctl-outputs.conf",
     "mpd_state_file": "/opt/mpd-upnp/state/mpd/state",
     "mpd_container": "mpd",
+    "caldera_user": "caldera",
+    "caldera_home": "/var/lib/caldera",
+    "caldera_unit": "caldera-music.service",
 }
 # Plexamp keeps each setting in its own file; values carry a type prefix
 # ("S" string, "N" number). The device is stored as an ALSA name, "hw:0,0".
 PLEX_DEVICE_FILE = "%40Plexamp%3Asettings%3AaudioDeviceUuid"
+
+# Engines that drive exactly one DAC (MPD is the multi-DAC one).
+SINGLE = ("plexamp", "caldera")
+NAMES = {"mpd": "MPD", "plexamp": "Plexamp", "caldera": "Caldera"}
 
 
 class Error(Exception):
@@ -172,7 +180,13 @@ class Engine:
     label: str
     units: list
     boot_method: str            # "enable" (normal unit) or "mask" (quadlet)
+    user: str = None            # set: units live in this account's user manager
     props: dict = field(default_factory=dict)
+    note: str = ""              # extra state worth showing ("login needed", ...)
+
+    @property
+    def scope(self):
+        return ["--user", "-M", f"{self.user}@"] if self.user else []
 
     def _all(self, pred):
         return all(pred(self.props.get(u, {})) for u in self.units)
@@ -223,26 +237,51 @@ class Engine:
         return "stopped"
 
 
+def _show(scope, units):
+    p = run(["systemctl", *scope, "show", "--no-pager",
+             "-p", "Id,LoadState,ActiveState,SubState,UnitFileState", "--", *units],
+            check=False)
+    if p.returncode != 0:
+        return None
+    blocks = [b for b in p.stdout.strip().split("\n\n") if b.strip()]
+    return {u: dict(l.split("=", 1) for l in b.splitlines() if "=" in l)
+            for u, b in zip(units, blocks)}
+
+
+def caldera_unit_file(cfg):
+    return os.path.join(cfg["caldera_home"], ".config/systemd/user", cfg["caldera_unit"])
+
+
 def read_engines(cfg):
     engines = {
         "plexamp": Engine("plexamp", "Plexamp", [cfg["plexamp_unit"]], "enable"),
+        "caldera": Engine("caldera", "Caldera", [cfg["caldera_unit"]], "enable",
+                          user=cfg["caldera_user"]),
         "mpd": Engine("mpd", "MPD/UPnP", list(cfg["mpd_units"]), "mask"),
     }
-    units = [u for e in engines.values() for u in e.units]
-    out = run(["systemctl", "show", "--no-pager",
-               "-p", "Id,LoadState,ActiveState,SubState,UnitFileState", "--", *units],
-              check=False).stdout
-    blocks = [b for b in out.strip().split("\n\n") if b.strip()]
-    props = {}
-    for unit, block in zip(units, blocks):
-        props[unit] = dict(l.split("=", 1) for l in block.splitlines() if "=" in l)
+    system = [u for e in engines.values() if not e.user for u in e.units]
+    props = _show([], system) or {}
     for e in engines.values():
+        if e.user:
+            continue
         e.props = {u: props.get(u, {}) for u in e.units}
+    cal = engines["caldera"]
+    if os.path.exists(caldera_unit_file(cfg)):
+        p = _show(cal.scope, cal.units)
+        if p is None:
+            # No user manager for the account: lingering is off (the role
+            # turns it on), so the unit can't run or start at boot.
+            p = {u: {"LoadState": "loaded", "ActiveState": "inactive",
+                     "UnitFileState": "disabled"} for u in cal.units}
+            cal.note = f"no user manager - loginctl enable-linger {cal.user}"
+        cal.props = p
+        if not cal.note and not caldera_prefs(cfg).get("plex", {}).get("token"):
+            cal.note = "login needed: sudo audioctl caldera-login"
     return engines
 
 
-def systemctl(*args):
-    run(["systemctl", *args])
+def sctl(eng, *args):
+    run(["systemctl", *eng.scope, *args])
 
 
 # --------------------------------------------------------------------------
@@ -255,17 +294,31 @@ class Output:
     name: str
     device: str
     enabled: bool = True
+    added: bool = False     # added by audioctl (mpd.d include), not by the Ansible role
+
+
+def _output_blocks(text):
+    """key -> value of every audio_output block, in config order."""
+    return [dict(re.findall(r'^\s*(\w+)\s+"([^"]*)"', b.group(1), re.M))
+            for b in re.finditer(r"audio_output\s*\{(.*?)\n\s*\}", text, re.S)]
+
+
+def mpd_has_include(cfg):
+    """Is mpd.conf new enough to load the outputs audioctl adds?"""
+    name = re.escape(os.path.basename(cfg["mpd_extra_conf"]))
+    return bool(re.search(rf'^\s*include(?:_optional)?\s+"[^"]*{name}"', _read(cfg["mpd_conf"]), re.M))
 
 
 def read_mpd_outputs(cfg, mpd_running):
-    text = _read(cfg["mpd_conf"])
+    blocks = [(kv, False) for kv in _output_blocks(_read(cfg["mpd_conf"]))]
+    if mpd_has_include(cfg):    # the include line comes after the role's outputs
+        blocks += [(kv, True) for kv in _output_blocks(_read(cfg["mpd_extra_conf"]))]
     outs = []
-    for i, block in enumerate(re.finditer(r"audio_output\s*\{(.*?)\n\s*\}", text, re.S), 1):
-        kv = dict(re.findall(r'^\s*(\w+)\s+"([^"]*)"', block.group(1), re.M))
+    for i, (kv, added) in enumerate(blocks, 1):
         if kv.get("type") != "alsa":
             continue
         outs.append(Output(i, kv.get("name", f"output {i}"), kv.get("device", "default"),
-                           kv.get("enabled", "yes") != "no"))
+                           kv.get("enabled", "yes") != "no", added))
     states = None
     if mpd_running:
         p = run(["podman", "exec", cfg["mpd_container"], "mpc", "outputs"], check=False)
@@ -318,6 +371,126 @@ def mpd_set_output(cfg, snap, out, on):
         os.chmod(tmp, st.st_mode & 0o7777)
         os.replace(tmp, path)
     out.enabled = on
+
+
+# --------------------------------------------------------------------------
+# MPD outputs for DACs plugged in later
+#
+# The role writes one audio_output per DAC in mpd_upnp_alsa_outputs. For any
+# other DAC, `route <DAC> mpd` adds an output here instead: audioctl's state
+# file lists them, and mpd.conf includes the file generated from that list
+# (regenerated before every MPD start by an ExecStartPre drop-in). MPD can't
+# add outputs at runtime, so adding/forgetting one restarts it.
+# --------------------------------------------------------------------------
+
+def _clean(text):
+    return re.sub(r'["\\\n]', "", text).strip()
+
+
+def mpd_sync(cfg, quiet=False):
+    """Regenerate the include from the state file. Drops DACs the Ansible
+    list has since gained, so a DAC never gets two outputs."""
+    path = cfg["mpd_extra_conf"]
+    if not os.path.isdir(os.path.dirname(path)):
+        return []           # mpd_upnp role predates this; nothing to write into
+    static = _output_blocks(_read(cfg["mpd_conf"]))
+    static_refs = {device_card_ref(kv.get("device")) for kv in static}
+    mixer = next((kv["mixer_type"] for kv in static if "mixer_type" in kv), "none")
+    state = load_state(cfg)
+    extra, notes = [], []
+    for o in state.get("mpd_extra", []):
+        if o["card"] in static_refs:
+            notes.append(f"{o['card']} is in mpd_upnp_alsa_outputs now - dropped audioctl's "
+                         f"output '{o['name']}' for it")
+        else:
+            extra.append(o)
+    if notes:
+        state["mpd_extra"] = extra
+        save_state(cfg, state)
+    text = ("# Managed by audioctl - do not edit. DACs added with `audioctl route <DAC> mpd`;\n"
+            "# remove one with `audioctl mpd-forget <DAC>`. Rewritten from\n"
+            f"# {cfg['state_file']} before every MPD start.\n")
+    for o in extra:
+        text += (f'\naudio_output {{\n    type "alsa"\n    name "{o["name"]}"\n'
+                 f'    device "{o["device"]}"\n    mixer_type "{mixer}"\n'
+                 '    auto_resample "no"\n    auto_format "no"\n    auto_channels "no"\n}\n')
+    if _read(path) != text:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    if not quiet:
+        for n in notes:
+            print(f"audioctl: {n}", file=sys.stderr)
+    return notes
+
+
+def _restart_mpd(cfg, eng, expect=None, gone=None):
+    """Restart just mpd.service (upmpdcli Requires= it, so it follows), then
+    wait for MPD to answer with the new output list."""
+    masked = eng.masked_units
+    if masked:
+        sctl(eng, "unmask", *masked)
+    try:
+        sctl(eng, "restart", eng.units[0])
+    finally:
+        if masked:
+            sctl(eng, "mask", *masked)
+    names = re.findall(r"^Output \d+ \((.*)\) is", mpc(cfg, "outputs").stdout, re.M)
+    if (expect and expect not in names) or (gone and gone in names):
+        raise Error(f"MPD restarted but its outputs are {names} - see journalctl -u mpd")
+
+
+def mpd_add_output(cfg, snap, card, notes):
+    eng = snap.engines["mpd"]
+    if not mpd_has_include(cfg) or not os.path.isdir(os.path.dirname(cfg["mpd_extra_conf"])):
+        raise Error(f"MPD has no output for {card.id}, and its config predates audioctl "
+                    "adding DACs - redeploy mpd-upnp.yml once, then retry")
+    if not card.pcms:
+        raise Error(f"{card.id} has no playback device")
+    taken = {o.name.lower() for o in snap.outputs}
+    name = _clean(card.desc) or card.id
+    if name.lower() in taken:
+        name = f"{name} ({card.id})"
+    state = load_state(cfg)
+    state.setdefault("mpd_extra", []).append(
+        {"card": card.id, "name": name, "device": f"hw:CARD={card.id},DEV={card.pcms[0]}"})
+    save_state(cfg, state)
+    mpd_sync(cfg, quiet=True)
+    if eng.running:
+        _restart_mpd(cfg, eng, expect=name)
+        notes.append(f"MPD output '{name}' added (MPD restarted)")
+    else:
+        notes.append(f"MPD output '{name}' added")
+    fresh = snapshot(cfg)
+    out = fresh.output_for(find_card(fresh.cards, card.id))
+    if out and not out.enabled:   # a stale per-name "disabled" in MPD's state file
+        mpd_set_output(cfg, fresh, out, True)
+    return out
+
+
+def mpd_forget(cfg, ref):
+    """Remove an output audioctl added (the DAC may already be unplugged)."""
+    require_root()
+    state = load_state(cfg)
+    extra = state.get("mpd_extra", [])
+    hit = next((o for o in extra if ref.lower() in (o["card"].lower(), o["name"].lower())), None)
+    if not hit:
+        snap = snapshot(cfg)
+        if any(ref.lower() in (o.name.lower(), (device_card_ref(o.device) or "").lower())
+               for o in snap.outputs if not o.added):
+            raise Error(f"{ref}'s MPD output comes from mpd_upnp_alsa_outputs - "
+                        "remove it there and redeploy mpd-upnp.yml")
+        raise Error(f"audioctl hasn't added an MPD output for '{ref}'")
+    state["mpd_extra"] = [o for o in extra if o is not hit]
+    save_state(cfg, state)
+    mpd_sync(cfg, quiet=True)
+    eng = snapshot(cfg).engines["mpd"]
+    if eng.running:
+        _restart_mpd(cfg, eng, gone=hit["name"])
+        return [f"MPD output '{hit['name']}' removed (MPD restarted)"]
+    return [f"MPD output '{hit['name']}' removed"]
 
 
 # --------------------------------------------------------------------------
@@ -384,6 +557,66 @@ def plexamp_sync(cfg, cards=None, quiet=False):
     return card
 
 
+# Caldera Music: preferences.json holds only non-default values, nested by
+# dot-path (audio.outputDeviceUid -> {"audio": {"outputDeviceUid": ...}}).
+# Unlike Plexamp it takes the stable hw:CARD=<id> name, so no re-pinning.
+
+def caldera_prefs(cfg):
+    try:
+        with open(os.path.join(cfg["caldera_home"], ".config/caldera-music/preferences.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def caldera_cmd(cfg, *args, capture=True):
+    """Run the caldera-music binary as its own account (never as root, so
+    everything it writes stays owned by caldera)."""
+    home = cfg["caldera_home"]
+    inst = os.path.join(home, "caldera-music")
+    cmd = ["runuser", "-u", cfg["caldera_user"], "--", "env", f"HOME={home}",
+           f"LD_LIBRARY_PATH={inst}/lib", f"{inst}/bin/caldera-music",
+           "--config", os.path.join(home, ".config/caldera-music"), *args]
+    if capture:
+        return run(cmd)
+    return subprocess.run(cmd).returncode
+
+
+def caldera_device(cfg):
+    return caldera_prefs(cfg).get("audio", {}).get("outputDeviceUid", "default")
+
+
+# --------------------------------------------------------------------------
+# One interface for the single-DAC engines' DAC setting.
+# Callers stop the engine first: both write settings files the running
+# program could overwrite on its way down.
+# --------------------------------------------------------------------------
+
+def single_card_id(cfg, cards, key):
+    if key == "plexamp":
+        state = load_state(cfg)
+        if "plexamp_card" in state:
+            return state["plexamp_card"]
+        # not routed through audioctl yet: report what Plexamp's web UI chose
+        c = find_card(cards, device_card_ref(plex_device(cfg)))
+        return c.id if c else None
+    ref = device_card_ref(caldera_device(cfg))
+    c = find_card(cards, ref)
+    return c.id if c else ref        # ref but no card = configured DAC unplugged
+
+
+def single_set(cfg, cards, key, card):
+    if key == "plexamp":
+        state = load_state(cfg)
+        state["plexamp_card"] = card.id if card else None
+        save_state(cfg, state)
+        if card:
+            plexamp_sync(cfg, cards, quiet=True)
+    else:
+        dev = f"hw:CARD={card.id},DEV={card.pcms[0] if card.pcms else 0}" if card else "default"
+        caldera_cmd(cfg, "--set", f"audio.outputDeviceUid={dev}")
+
+
 # --------------------------------------------------------------------------
 # Snapshot of the whole box
 # --------------------------------------------------------------------------
@@ -393,8 +626,13 @@ class Snapshot:
     cards: list
     engines: dict
     outputs: list
-    plex_card_id: str       # DAC routed to Plexamp (id), or None
-    plex_card_dangling: bool  # assigned DAC not connected right now
+    single: dict            # single-DAC engine key -> DAC id routed to it (or None)
+
+    def single_card(self, key):
+        return find_card(self.cards, self.single.get(key))
+
+    def dangling(self, key):    # routed DAC isn't connected right now
+        return bool(self.single.get(key)) and not self.single_card(key)
 
     def output_for(self, card):
         for o in self.outputs:
@@ -412,16 +650,12 @@ class Snapshot:
             raise Error(f"no DAC '{ref}' (have: {', '.join(c.id for c in self.cards)})")
         return c
 
-    def plex_card(self):
-        return find_card(self.cards, self.plex_card_id)
-
     def routes(self, card):
         r = []
         o = self.output_for(card)
         if o and o.enabled and self.engines["mpd"].installed:
             r.append("mpd")
-        if self.plex_card_id == card.id and self.engines["plexamp"].installed:
-            r.append("plexamp")
+        r += [k for k in SINGLE if self.single.get(k) == card.id and self.engines[k].installed]
         return r
 
 
@@ -429,14 +663,8 @@ def snapshot(cfg):
     cards = read_cards(cfg)
     engines = read_engines(cfg)
     outputs = read_mpd_outputs(cfg, engines["mpd"].running) if engines["mpd"].installed else []
-    state = load_state(cfg)
-    if "plexamp_card" in state:
-        plex_id = state["plexamp_card"]
-    else:  # not routed through audioctl yet: report what Plexamp's web UI chose
-        c = find_card(cards, device_card_ref(plex_device(cfg)))
-        plex_id = c.id if c else None
-    dangling = bool(plex_id) and not find_card(cards, plex_id)
-    return Snapshot(cards, engines, outputs, plex_id, dangling)
+    single = {k: single_card_id(cfg, cards, k) if engines[k].installed else None for k in SINGLE}
+    return Snapshot(cards, engines, outputs, single)
 
 
 # --------------------------------------------------------------------------
@@ -448,13 +676,46 @@ def _start_units(eng):
     if masked:
         # Boot-disabled quadlet: lift the mask just long enough to start it,
         # so "running now, but not at boot" is still possible.
-        systemctl("unmask", *masked)
+        sctl(eng, "unmask", *masked)
         try:
-            systemctl("start", *eng.units)
+            sctl(eng, "start", *eng.units)
         finally:
-            systemctl("mask", *masked)
+            sctl(eng, "mask", *masked)
     else:
-        systemctl("start", *eng.units)
+        sctl(eng, "start", *eng.units)
+
+
+def _stop_units(eng):
+    sctl(eng, "stop", *reversed(eng.units))
+
+
+def _release(cfg, snap, card, keep, notes):
+    """Take `card` away from every engine except `keep`."""
+    out = snap.output_for(card)
+    if keep != "mpd" and out and out.enabled:
+        mpd_set_output(cfg, snap, out, False)
+        notes.append(f"{out.name} disabled in MPD")
+    for k in SINGLE:
+        e = snap.engines[k]
+        if k == keep or not e.installed or snap.single.get(k) != card.id:
+            continue
+        if e.running:
+            _stop_units(e)
+            notes.append(f"{e.label} stopped (it was on {card.id})")
+        if e.boot:
+            # With no DAC it would come up at boot on ALSA "default" - i.e.
+            # whatever card 0 is, quite possibly another engine's DAC.
+            sctl(e, "disable", *e.units)
+            notes.append(f"{e.label} no longer starts at boot (no DAC)")
+        single_set(cfg, snap.cards, k, None)
+        snap.single[k] = None
+
+
+def _check_ready(eng):
+    if not eng.installed:
+        raise Error(f"{eng.label} is not installed")
+    if eng.note.startswith("no user manager"):
+        raise Error(f"{eng.label}: {eng.note}")
 
 
 def start(cfg, key):
@@ -462,35 +723,37 @@ def start(cfg, key):
     snap = snapshot(cfg)
     eng = snap.engines[key]
     notes = []
-    if not eng.installed:
-        raise Error(f"{eng.label} is not installed")
-    if key == "plexamp":
-        card = snap.plex_card()
+    _check_ready(eng)
+    if key in SINGLE:
+        card = snap.single_card(key)
         if not card:
-            raise Error("Plexamp has no DAC" + (f" ('{snap.plex_card_id}' is unplugged)"
-                        if snap.plex_card_dangling else " - route one to it first"))
-        out = snap.output_for(card)
-        if out and out.enabled:
-            mpd_set_output(cfg, snap, out, False)
-            notes.append(f"{card.id} removed from MPD so Plexamp can open it")
-        plexamp_sync(cfg, snap.cards, quiet=True)
+            raise Error(f"{eng.label} has no DAC" + (f" ('{snap.single[key]}' is unplugged)"
+                        if snap.dangling(key) else " - route one to it first"))
+        if eng.note.startswith("login needed"):
+            raise Error(f"{eng.label} isn't logged in to Plex yet - run: sudo audioctl caldera-login")
+        _release(cfg, snap, card, key, notes)
+        if key == "plexamp":
+            plexamp_sync(cfg, snap.cards, quiet=True)
         _start_units(eng)
-        notes.append(f"Plexamp started on {card.id}")
+        notes.append(f"{eng.label} started on {card.id}")
     else:
         _start_units(eng)
         notes.append(f"{eng.label} started")
-        if snap.engines["plexamp"].running and snap.plex_card():
-            out = snap.output_for(snap.plex_card())
-            if out and out.enabled:
-                mpd_set_output(cfg, snapshot(cfg), out, False)
-                notes.append(f"{out.name} disabled in MPD: Plexamp holds {snap.plex_card_id}")
+        fresh = None
+        for k in SINGLE:
+            c = snap.single_card(k)
+            out = c and snap.output_for(c)
+            if snap.engines[k].running and out and out.enabled:
+                fresh = fresh or snapshot(cfg)       # mpc numbering from the live MPD
+                mpd_set_output(cfg, fresh, out, False)
+                notes.append(f"{out.name} disabled in MPD: {snap.engines[k].label} holds {c.id}")
     return notes
 
 
 def stop(cfg, key):
     require_root()
     eng = snapshot(cfg).engines[key]
-    systemctl("stop", *reversed(eng.units))
+    _stop_units(eng)
     return [f"{eng.label} stopped"]
 
 
@@ -501,16 +764,20 @@ def restart(cfg, key):
 
 def set_boot(cfg, key, on):
     require_root()
-    eng = snapshot(cfg).engines[key]
+    snap = snapshot(cfg)
+    eng = snap.engines[key]
+    _check_ready(eng)
+    if on and key in SINGLE and not snap.single.get(key):
+        raise Error(f"{eng.label} has no DAC - route one to it before enabling it at boot")
     if eng.boot_method == "mask":
         # Quadlet units are generated; their [Install] can't be disabled, only masked.
         if on:
             if eng.masked_units:
-                systemctl("unmask", *eng.masked_units)
+                sctl(eng, "unmask", *eng.masked_units)
         else:
-            systemctl("mask", *eng.units)
+            sctl(eng, "mask", *eng.units)
     else:
-        systemctl("enable" if on else "disable", *eng.units)
+        sctl(eng, "enable" if on else "disable", *eng.units)
     return [f"{eng.label} {'starts' if on else 'no longer starts'} at boot"]
 
 
@@ -519,51 +786,36 @@ def route(cfg, ref, target):
     snap = snapshot(cfg)
     card = snap.card(ref)
     out = snap.output_for(card)
-    plex = snap.engines["plexamp"]
-    state = load_state(cfg)
     notes = []
-
-    def take_from_plexamp():
-        if snap.plex_card_id == card.id:
-            state["plexamp_card"] = None
-            save_state(cfg, state)
-            if plex.running:
-                systemctl("stop", *plex.units)
-                notes.append(f"Plexamp stopped (it was on {card.id})")
-
-    if target == "mpd":
+    if target == "off":
+        _release(cfg, snap, card, None, notes)
+        notes.append(f"{card.id} unrouted")
+    elif target == "mpd":
         if not snap.engines["mpd"].installed:
             raise Error("MPD/UPnP is not installed")
+        if not out and not card.pcms:
+            raise Error(f"{card.id} has no playback device")
+        _release(cfg, snap, card, "mpd", notes)
         if not out:
-            raise Error(f"MPD has no output for {card.id} - add "
-                        f'{{ name: ..., device: "hw:CARD={card.id}" }} to '
-                        "mpd_upnp_alsa_outputs and redeploy mpd-upnp.yml")
-        take_from_plexamp()
+            out = mpd_add_output(cfg, snap, card, notes)
+            notes.append(f"{card.id} -> MPD ({out.name if out else '?'})")
+            return notes
         if not out.enabled:
             mpd_set_output(cfg, snap, out, True)
         notes.append(f"{card.id} -> MPD ({out.name})")
-    elif target == "plexamp":
-        if not plex.installed:
-            raise Error("Plexamp is not installed")
-        if out and out.enabled:
-            mpd_set_output(cfg, snap, out, False)
-            notes.append(f"{out.name} disabled in MPD")
-        prev = snap.plex_card_id
-        state["plexamp_card"] = card.id
-        save_state(cfg, state)
-        if plex.running:
-            systemctl("stop", *plex.units)
-            plexamp_sync(cfg, snap.cards, quiet=True)
-            systemctl("start", *plex.units)
-            notes.append("Plexamp restarted")
-        else:
-            plexamp_sync(cfg, snap.cards, quiet=True)
-        notes.append(f"{card.id} -> Plexamp" + (f" ({prev} released)" if prev and prev != card.id else ""))
-    elif target == "off":
-        if out and out.enabled:
-            mpd_set_output(cfg, snap, out, False)
-        take_from_plexamp()
-        notes.append(f"{card.id} unrouted")
+    elif target in SINGLE:
+        eng = snap.engines[target]
+        _check_ready(eng)
+        _release(cfg, snap, card, target, notes)
+        prev, was_running = snap.single.get(target), eng.running
+        if was_running:
+            _stop_units(eng)
+        single_set(cfg, snap.cards, target, card)
+        if was_running:
+            _start_units(eng)
+            notes.append(f"{eng.label} restarted")
+        notes.append(f"{card.id} -> {eng.label}" +
+                     (f" ({prev} released)" if prev and prev != card.id else ""))
     else:
         raise Error(f"unknown target {target!r}")
     return notes
@@ -582,18 +834,38 @@ def mpd_only(cfg, ref):
 def mpd_all(cfg):
     require_root()
     snap = snapshot(cfg)
-    plex = snap.engines["plexamp"]
     notes = []
     for o in snap.outputs:
         card = find_card(snap.cards, device_card_ref(o.device))
-        if card and card.id == snap.plex_card_id and (plex.running or plex.boot):
-            notes.append(f"{card.id} kept on Plexamp")
-            continue
-        if card and card.id == snap.plex_card_id:
+        holder = next((k for k in SINGLE if card and snap.single.get(k) == card.id
+                       and snap.engines[k].installed), None)
+        if holder and (snap.engines[holder].running or snap.engines[holder].boot):
+            notes.append(f"{card.id} kept on {snap.engines[holder].label}")
+        elif holder:                # routed to an engine that's idle: take it
             notes += route(cfg, card.id, "mpd")
+            snap = snapshot(cfg)
         elif not o.enabled:
             mpd_set_output(cfg, snap, o, True)
     return notes + ["MPD plays to all its DACs"]
+
+
+def caldera_login(cfg, player_name=None):
+    """Interactive plex.tv/link PIN login, run as the caldera account."""
+    require_root()
+    eng = snapshot(cfg).engines["caldera"]
+    if not eng.installed:
+        raise Error("Caldera is not installed (run caldera-music.yml)")
+    was_running = eng.running
+    if was_running:            # it would overwrite the new token on its way down
+        _stop_units(eng)
+    args = ["--login"] + (["--player-name", player_name] if player_name else [])
+    rc = caldera_cmd(cfg, *args, capture=False)
+    if was_running:
+        _start_units(eng)
+    if rc != 0:
+        raise Error(f"caldera-music --login exited {rc}")
+    return ["Caldera logged in" + (" and restarted" if was_running else
+                                   " - route a DAC to it, then start it")]
 
 
 # --------------------------------------------------------------------------
@@ -620,29 +892,31 @@ def route_label(snap, card):
     names = []
     for k in r:
         e = snap.engines[k]
-        n = "MPD" if k == "mpd" else "Plexamp"
-        names.append(n if e.running else f"{n} (stopped)")
+        names.append(NAMES[k] if e.running else f"{NAMES[k]} (stopped)")
     label = " + ".join(names) or "-"
-    conflict = len(r) == 2 and all(snap.engines[k].running for k in r)
+    conflict = sum(snap.engines[k].running for k in r) > 1
     return label, conflict
 
 
 def status_dict(snap):
     return {
-        "engines": {k: {"label": e.label, "status": e.status, "boot": e.boot,
+        "engines": {k: {"label": e.label, "status": e.status, "boot": e.boot, "note": e.note,
+                        "dac": snap.single.get(k) if k in SINGLE else
+                        [c.id for c in snap.cards if "mpd" in snap.routes(c)],
                         "units": {u: e.props.get(u, {}).get("ActiveState") for u in e.units}}
-                    for k, e in snap.engines.items()},
+                    for k, e in snap.engines.items() if e.installed},
         "dacs": [{"id": c.id, "card": c.index, "desc": c.desc, "routes": snap.routes(c),
                   "mpd_output": (snap.output_for(c).name if snap.output_for(c) else None),
+                  "mpd_output_added": bool(snap.output_for(c) and snap.output_for(c).added),
                   "state": c.state, "rate": c.rate, "format": c.fmt, "owner": c.owner}
                  for c in snap.cards],
-        "plexamp_dac": snap.plex_card_id,
     }
 
 
 def print_status(snap):
     for e in snap.engines.values():
-        print(f"{e.label:<10} {e.status:<14} boot: {'on' if e.boot else 'off'}")
+        if e.installed:
+            print(f"{e.label:<10} {e.status:<14} boot: {'on ' if e.boot else 'off'}  {e.note}".rstrip())
     print()
     print(f"{'DAC':<8} {'Routed to':<26} {'Now':<36} Description")
     for c in snap.cards:
@@ -650,8 +924,14 @@ def print_status(snap):
         if conflict:
             label += "  CONFLICT"
         print(f"{c.id:<8} {label:<26} {card_now(c):<36} {c.desc}")
-    if snap.plex_card_dangling:
-        print(f"\nPlexamp's DAC '{snap.plex_card_id}' is not connected.")
+    for k in SINGLE:
+        if snap.dangling(k):
+            print(f"\n{snap.engines[k].label}'s DAC '{snap.single[k]}' is not connected.")
+    for o in snap.outputs:
+        if not find_card(snap.cards, device_card_ref(o.device)):
+            fix = (f"sudo audioctl mpd-forget {device_card_ref(o.device)}" if o.added
+                   else "it's in mpd_upnp_alsa_outputs")
+            print(f"\nMPD output '{o.name}' ({o.device}): DAC not connected ({fix}).")
 
 
 # --------------------------------------------------------------------------
@@ -670,15 +950,18 @@ HELP = """\
    b   toggle start-at-boot
 
  On a DAC row:
-   m   route to MPD (added to whatever MPD already plays to)
+   m   route to MPD (added to whatever MPD already plays to). A DAC MPD
+       has no output for yet gets one; that restarts MPD, which stops
+       what it's playing. `audioctl mpd-forget <DAC>` removes it again.
    1   MPD plays to this DAC only
-   a   MPD plays to all its DACs (except the one Plexamp is using)
-   p   route to Plexamp (Plexamp drives exactly one DAC)
+   a   MPD plays to all its DACs (except ones Plexamp/Caldera are using)
+   p   route to Plexamp   (drives exactly one DAC)
+   c   route to Caldera   (drives exactly one DAC)
    o   unroute
 
- A DAC goes to one engine at a time: Plexamp holds its DAC open the whole
- time it runs, so routing keeps MPD off it. Both engines can then run at
- once on different DACs.
+ A DAC goes to one engine at a time: an engine with a DAC open makes it
+ busy for the others, so routing keeps them apart. All the engines can
+ then run at once, each on its own DAC(s).
 """
 
 
@@ -765,9 +1048,9 @@ class TUI:
                 self.put(y, 15, f"● {e.status:<9}", col)
                 self.put(y, 27, f"boot: {'on ' if e.boot else 'off'}",
                          0 if e.boot else curses.A_DIM)
-                if e.key == "plexamp":
-                    dac = snap.plex_card_id or "none"
-                    if snap.plex_card_dangling:
+                if e.key in SINGLE:
+                    dac = snap.single.get(e.key) or "none"
+                    if snap.dangling(e.key):
                         dac += " (unplugged)"
                 else:
                     dac = ", ".join(c.id for c in snap.cards if "mpd" in snap.routes(c)) or "none"
@@ -777,6 +1060,8 @@ class TUI:
                     self.put(y, 62, "  ".join(f"{u.removesuffix('.service')}:"
                                               f"{e.props.get(u, {}).get('ActiveState', '?')}"
                                               for u in e.units), self.YELLOW)
+                elif e.note:
+                    self.put(y, 62, e.note, self.YELLOW)
             else:
                 c = item
                 label, conflict = route_label(snap, c)
@@ -790,8 +1075,12 @@ class TUI:
             y += 1
         # footer
         kind = rows[self.sel][0] if rows else None
-        keys = ("s start/stop   r restart   b boot on/off   Enter menu" if kind == "engine" else
-                "m →MPD   1 MPD only this   a MPD all   p →Plexamp   o off   Enter menu")
+        if kind == "engine":
+            keys = "s start/stop   r restart   b boot on/off   Enter menu"
+        else:
+            keys = "m →MPD   1 MPD only this   a MPD all   " + "".join(
+                f"{k[0]} →{NAMES[k]}   " for k in SINGLE if snap.engines[k].installed
+            ) + "o off   Enter menu"
         self.put(h - 2, 1, keys, curses.A_DIM)
         if self.msg:
             self.put(h - 1, 1, self.msg, self.RED if self.msg_err else self.GREEN)
@@ -848,8 +1137,8 @@ class TUI:
             self.do(mpd_only, c.id)
         elif key == "a":
             self.do(lambda cfg: mpd_all(cfg))
-        elif key == "p":
-            self.do(route, c.id, "plexamp")
+        elif key in ("p", "c"):
+            self.do(route, c.id, {"p": "plexamp", "c": "caldera"}[key])
         elif key == "o":
             self.do(route, c.id, "off")
 
@@ -890,13 +1179,16 @@ class TUI:
                         self.engine_action(item, choice)
                 elif kind == "dac":
                     opts = [("Route to MPD (add)", "m"), ("MPD: only this DAC", "1"),
-                            ("MPD: all DACs", "a"), ("Route to Plexamp", "p"), ("Unroute", "o")]
+                            ("MPD: all DACs", "a")]
+                    opts += [(f"Route to {NAMES[k]}", k[0]) for k in SINGLE
+                             if self.snap.engines[k].installed]
+                    opts += [("Unroute", "o")]
                     choice = self.menu(f"{item.id} - {item.desc}", opts)
                     if choice:
                         self.dac_action(item, choice)
-            elif kind == "engine" and ch in "srb":
+            elif kind == "engine" and ch and ch in "srb":
                 self.engine_action(item, ch)
-            elif kind == "dac" and ch in "m1apo":
+            elif kind == "dac" and ch and ch in "m1apco":
                 self.dac_action(item, ch)
 
 
@@ -918,14 +1210,19 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     for name in ("start", "stop", "restart", "enable", "disable"):
         p = sub.add_parser(name, help=f"{name} an engine" + (" at boot" if name in ("enable", "disable") else ""))
-        p.add_argument("engine", choices=["plexamp", "mpd"])
+        p.add_argument("engine", choices=["plexamp", "caldera", "mpd"])
     p = sub.add_parser("route", help="route a DAC (card id, number or MPD output name)")
     p.add_argument("dac")
-    p.add_argument("target", choices=["mpd", "plexamp", "off"])
+    p.add_argument("target", choices=["mpd", "plexamp", "caldera", "off"])
     p = sub.add_parser("only", help="MPD plays to this DAC only")
     p.add_argument("dac")
-    sub.add_parser("all", help="MPD plays to all its DACs (except Plexamp's)")
+    sub.add_parser("all", help="MPD plays to all its DACs (except Plexamp's/Caldera's)")
+    p = sub.add_parser("caldera-login", help="log Caldera in to Plex (interactive plex.tv/link PIN)")
+    p.add_argument("--player-name", help="name shown in Plex's cast menu")
+    p = sub.add_parser("mpd-forget", help="remove an MPD output audioctl added for a DAC")
+    p.add_argument("dac", help="card id or output name (the DAC may be unplugged)")
     sub.add_parser("plexamp-sync", help=argparse.SUPPRESS)
+    sub.add_parser("mpd-sync", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     cfg = load_config()
     try:
@@ -942,6 +1239,12 @@ def main(argv=None):
         if args.cmd == "plexamp-sync":
             plexamp_sync(cfg)
             return 0         # never block Plexamp from starting
+        if args.cmd == "mpd-sync":
+            try:
+                mpd_sync(cfg)
+            except OSError as e:
+                print(f"audioctl: mpd-sync: {e}", file=sys.stderr)
+            return 0         # never block MPD from starting
         notes = {
             "start": lambda: start(cfg, args.engine),
             "stop": lambda: stop(cfg, args.engine),
@@ -951,6 +1254,8 @@ def main(argv=None):
             "route": lambda: route(cfg, args.dac, args.target),
             "only": lambda: mpd_only(cfg, args.dac),
             "all": lambda: mpd_all(cfg),
+            "caldera-login": lambda: caldera_login(cfg, args.player_name),
+            "mpd-forget": lambda: mpd_forget(cfg, args.dac),
         }[args.cmd]()
         for n in notes:
             print(n)

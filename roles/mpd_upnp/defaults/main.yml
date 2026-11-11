@@ -27,6 +27,8 @@ mpd_upnp_alsa_device: "default"
 #   mpd_upnp_alsa_outputs:
 #     - { name: "Hifi DAC", device: "hw:CARD=AUDIO" }
 #     - { name: "Mesh DAC", device: "hw:CARD=Card" }
+# A DAC that isn't listed can still be added later without a redeploy:
+# `sudo audioctl route <DAC> mpd` (audioctl role) adds an output for it.
 # Outputs are fed from one shared stream but each DAC runs on its own
 # clock: fine for separate rooms/headphones, not sample-locked for two
 # speakers in the same room.

@@ -6,6 +6,9 @@
     mode: "0755"
   loop:
     - "{{ mpd_upnp_base_dir }}/etc"
+    # audioctl writes outputs for DACs plugged in later here (see mpd.conf);
+    # this role never touches the file inside.
+    - "{{ mpd_upnp_base_dir }}/etc/mpd.d"
     - "{{ mpd_upnp_base_dir }}/state/mpd"
     # music/ stays empty (streams only) and playlists/ likely unused, but
     # MPD throws startup exceptions into the log if they don't exist.

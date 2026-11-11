@@ -24,11 +24,14 @@
     state: directory
     mode: "0755"
 
-- name: Create Plexamp drop-in directory
+- name: Create Plexamp and MPD drop-in directories
   ansible.builtin.file:
-    path: "/etc/systemd/system/{{ audioctl_plexamp_service }}.service.d"
+    path: "/etc/systemd/system/{{ item }}.service.d"
     state: directory
     mode: "0755"
+  loop:
+    - "{{ audioctl_plexamp_service }}"
+    - mpd
 
 # Harmless on a box without Plexamp: a drop-in for a unit that doesn't
 # exist is simply never loaded.
@@ -36,6 +39,14 @@
   ansible.builtin.template:
     src: plexamp-audioctl.conf.j2
     dest: "/etc/systemd/system/{{ audioctl_plexamp_service }}.service.d/audioctl.conf"
+    mode: "0644"
+  notify: reload systemd
+
+# Drop-ins apply to quadlet-generated units too.
+- name: Regenerate audioctl's extra MPD outputs before every MPD start
+  ansible.builtin.template:
+    src: mpd-audioctl.conf.j2
+    dest: /etc/systemd/system/mpd.service.d/audioctl.conf
     mode: "0644"
   notify: reload systemd
 

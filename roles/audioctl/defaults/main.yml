@@ -5,8 +5,10 @@
 # "command not found".
 audioctl_bin: /usr/sbin/audioctl
 
-# These must match the plexamp_headless / mpd_upnp roles' settings. The
+# These must match the plexamp_headless / mpd_upnp / caldera_music roles' settings. The
 # defaults below are those roles' defaults; override here if you changed them.
 audioctl_plexamp_home: /opt/plexamp
 audioctl_plexamp_service: plexamp
 audioctl_mpd_base_dir: /opt/mpd-upnp
+audioctl_caldera_user: caldera
+audioctl_caldera_home: /var/lib/caldera

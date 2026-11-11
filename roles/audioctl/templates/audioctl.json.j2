@@ -4,6 +4,10 @@
   "plexamp_settings_dir": "{{ audioctl_plexamp_home }}/.local/share/Plexamp/Settings",
   "mpd_units": ["mpd.service", "upmpdcli.service"],
   "mpd_conf": "{{ audioctl_mpd_base_dir }}/etc/mpd.conf",
+  "mpd_extra_conf": "{{ audioctl_mpd_base_dir }}/etc/mpd.d/audioctl-outputs.conf",
   "mpd_state_file": "{{ audioctl_mpd_base_dir }}/state/mpd/state",
-  "mpd_container": "mpd"
+  "mpd_container": "mpd",
+  "caldera_user": "{{ audioctl_caldera_user }}",
+  "caldera_home": "{{ audioctl_caldera_home }}",
+  "caldera_unit": "caldera-music.service"
 }

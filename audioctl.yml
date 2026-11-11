@@ -1,6 +1,6 @@
 ---
 - name: Deploy audioctl (engine + DAC routing TUI)
-  hosts: plexamp_endpoint:mpd_upnp_endpoint
+  hosts: plexamp_endpoint:mpd_upnp_endpoint:caldera_endpoint
   become: true
 
   roles:

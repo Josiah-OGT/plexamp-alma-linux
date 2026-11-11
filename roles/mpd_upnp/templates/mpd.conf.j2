@@ -35,3 +35,7 @@ audio_output {
     auto_channels "no"
 }
 {% endfor %}
+
+# DACs that aren't in the list above: `audioctl route <DAC> mpd` adds an
+# output for them in this file (managed by audioctl, absent without it).
+include_optional "/etc/mpd.d/audioctl-outputs.conf"

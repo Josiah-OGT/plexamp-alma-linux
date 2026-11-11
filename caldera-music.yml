@@ -1,0 +1,10 @@
+---
+- name: Deploy Caldera Music headless Plex player
+  hosts: caldera_endpoint
+  become: true
+
+  roles:
+    - role: caldera_music
+      vars:
+        caldera_music_lan_cidr: "CHANGE_ME/24"   # set to your actual LAN subnet
+        # caldera_music_player_name: "Den"        # name in Plex's cast menu
